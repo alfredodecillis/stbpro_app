@@ -1,33 +1,24 @@
-; inno_installer.iss
-#define MyAppName "STB_PRO"
-#define MyAppVersion "1.0.0"
-#define MyAppPublisher "Your Org"
-#define MyAppExeName "STB_PRO.exe"
+; inno_installer.iss — per build ONEFILE
 
 [Setup]
-AppId={{A1B2C3D4-1111-2222-3333-444455556666}
-AppName={#MyAppName}
-AppVersion={#MyAppVersion}
-AppPublisher={#MyAppPublisher}
-DefaultDirName={commonpf}\{#MyAppName}
-DefaultGroupName={#MyAppName}
-DisableProgramGroupPage=yes
-OutputDir=.
+AppName=STB_PRO
+AppVersion=1.0.0
+DefaultDirName={autopf}\STB_PRO
+DefaultGroupName=STB_PRO
 OutputBaseFilename=STB_PRO-Setup
+OutputDir={#SourcePath}\Output
+SetupIconFile=stbpro.ico
+ArchitecturesInstallIn64BitMode=x64
 Compression=lzma
 SolidCompression=yes
-ArchitecturesAllowed=x64
-ArchitecturesInstallIn64BitMode=x64
-PrivilegesRequired=admin
-SetupIconFile=stbpro.ico
 
 [Files]
-; Copia il contenuto della cartella build PyInstaller onedir:
-Source: "dist\STB_PRO\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; con --onefile esiste SOLO il .exe, non la cartella STB_PRO\
+Source: "{#SourcePath}\dist\STB_PRO.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{commondesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{group}\STB_PRO"; Filename: "{app}\STB_PRO.exe"; WorkingDir: "{app}"
+Name: "{commondesktop}\STB_PRO"; Filename: "{app}\STB_PRO.exe"; Tasks: desktopicon
 
 [Tasks]
-Name: "desktopicon"; Description: "Crea un'icona sul Desktop"; GroupDescription: "Opzioni aggiuntive:"; Flags: unchecked
+Name: "desktopicon"; Description: "Crea icona sul desktop"; GroupDescription: "Icone:"
