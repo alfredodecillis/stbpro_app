@@ -1,58 +1,82 @@
-name: Build Windows EXE + Installer
+name: Build Windows (STB_PRO)
 
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    paths:
+      - "**/*.py"
+      - "requirements.txt"
+      - "stbpro.ico"
+      - "inno_installer.iss"
+      - ".github/workflows/build-windows.yml"
+
+permissions:
+  contents: read
 
 jobs:
-  build:
+  build-win:
     runs-on: windows-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11 x64
+      - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          architecture: 'x64'
-
-      - name: Upgrade pip
-        run: python -m pip install --upgrade pip
 
       - name: Install deps
+        shell: powershell
         run: |
-          pip install -r requirements.txt
-          pip install pyinstaller==6.10.0
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
 
-      - name: PyInstaller (onedir, windowed)
+      - name: Build EXE (PyInstaller, PowerShell + backtick)
+        shell: powershell
         run: |
-          pyinstaller ^
-            --noconfirm ^
-            --onedir ^
-            --windowed ^
-            --name "STB_PRO" ^
-            --icon "stbpro.ico" ^
-            --add-data "stbpro.ico;." ^
-            app.py
+          python -m PyInstaller `
+            --noconfirm `
+            --clean `
+            --name STB_PRO `
+            --onefile `
+            --windowed `
+            --icon stbpro.ico `
+            --hidden-import asyncio `
+            --hidden-import bleak.backends.winrt `
+            --hidden-import tkinter `
+            --hidden-import matplotlib.backends.backend_tkagg `
+            app_win.py
 
-      - name: Ensure dist content
-        run: dir dist\STB_PRO
+      - name: Show dist
+        shell: powershell
+        run: |
+          Get-ChildItem -Recurse dist
 
+      # (FACOLTATIVO) Crea un installer .exe con Inno Setup se è presente inno_installer.iss
       - name: Install Inno Setup
-        run: choco install innosetup -y
-
-      - name: Build installer (Inno Setup)
+        if: ${{ hashFiles('inno_installer.iss') != '' }}
+        shell: powershell
         run: |
-          iscc inno_installer.iss
-        shell: cmd
+          choco install innosetup -y
 
-      - name: Upload artifacts (app + installer)
+      - name: Build Installer (ISCC)
+        if: ${{ hashFiles('inno_installer.iss') != '' }}
+        shell: powershell
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" inno_installer.iss
+
+      # Carica gli artefatti
+      - name: Upload artifact - EXE portable
         uses: actions/upload-artifact@v4
         with:
-          name: STB_PRO-Windows
-          path: |
-            dist/STB_PRO/**
-            STB_PRO-Setup.exe
+          name: STB_PRO-exe
+          path: dist\STB_PRO.exe
+          if-no-files-found: warn
+
+      - name: Upload artifact - Installer
+        if: ${{ hashFiles('Output\*.exe') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: STB_PRO-Setup
+          path: Output\*.exe
+          if-no-files-found: warn
