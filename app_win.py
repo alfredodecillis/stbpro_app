@@ -1,11 +1,12 @@
-# stbpro_dual_sync_ui_v3_watchdog_winprescan.py
+# stbpro_dual_sync_ui_v3_watchdog_winprescan_fix.py
 # - GUI invariata (4 grafici: ACC/GYR #1 e #2 a sinistra; 2 tabelle a destra)
 # - Stato generale + stati per #1 e #2
-# - Start sincronizzato SOLO dopo aver ricevuto il primo campione da entrambi
-# - CSV: un dato ogni 0.5 s, timeline regolare (hold-last-value)
-# - Connessione: ritentativi + watchdog no-data con ri-sottoscrizione/riconnessione
-# - Batteria: EMA + slew-rate + update rate limit per evitare salti
-# - **NUOVO**: pre-scan su Windows per trovare DUE device distinti (stessa sessione)
+# - Start sincronizzato SOLO dopo il primo campione di entrambi
+# - CSV: 1 riga ogni 0.5 s, timeline regolare (hold-last-value)
+# - Connessione: ritentativi + watchdog no-data (resubscribe/reconnect)
+# - Batteria: EMA + slew-rate + rate limit per evitare salti
+# - Prescan Windows NON BLOCCANTE con fallback agli indirizzi noti
+# - Prescan senza filtro per UUID di servizio (alcuni advertising non lo includono su Win)
 
 import sys, asyncio, struct, time, csv, os, threading, queue
 from collections import deque, defaultdict
@@ -15,16 +16,15 @@ from pathlib import Path
 from bleak import BleakClient, BleakScanner
 
 # ===================== CONFIG =====================
-ADDR_1 = "3718ACE8-DF5F-6A95-C883-B0A70601A2F7"  # STB_PRO #1 (hint address; accetta anche suffisso)
-ADDR_2 = "51C9EADA-28B1-2EAF-8711-E411311F64EA"  # STB_PRO #2 (hint address; accetta anche suffisso)
+ADDR_1 = "3718ACE8-DF5F-6A95-C883-B0A70601A2F7"  # STB_PRO #1 (hint address; ok anche suffisso)
+ADDR_2 = "51C9EADA-28B1-2EAF-8711-E411311F64EA"  # STB_PRO #2 (hint address; ok anche suffisso)
 
 # UUID "combined" (ACC+GYR in un frame)
-COMBINED_UUID_1 = "00c00000-0001-11e1-ac36-0002a5d5c51b"  # #1 noto
-COMBINED_UUID_2 = "00e00000-0001-11e1-ac36-0002a5d5c51b"  # #2 noto
+COMBINED_UUID_1 = "00c00000-0001-11e1-ac36-0002a5d5c51b"  # noto per #1
+COMBINED_UUID_2 = "00e00000-0001-11e1-ac36-0002a5d5c51b"  # noto per #2
 
-# BlueST service per filtro scan
-BLUEST_SERVICE   = "00000000-0001-11e1-9ab4-0002a5d5c51b"
-BAT_UUID         = "00020000-0001-11e1-ac36-0002a5d5c51b"
+# BlueST battery
+BAT_UUID = "00020000-0001-11e1-ac36-0002a5d5c51b"
 
 # Candidati autodetect combined (fallback se la "nota" non manda dati)
 COMBINED_CANDIDATES = [
@@ -32,33 +32,33 @@ COMBINED_CANDIDATES = [
     "00e00000-0001-11e1-ac36-0002a5d5c51b",
     "00190000-0001-11e1-ac36-0002a5d5c51b",
     "00000100-0001-11e1-ac36-0002a5d5c51b",
-    "00000014-0002-11e1-ac36-0002a5d5c51b",  # console/control su alcune board
+    "00000014-0002-11e1-ac36-0002a5d5c51b",
 ]
 
 CONNECT_TIMEOUT_S      = 10
 CONNECT_RETRIES        = 5
-RETRY_BACKOFF_BASE_S   = 1.2   # 1.2, 2.4, 3.6, ...
+RETRY_BACKOFF_BASE_S   = 1.2
 POST_CONNECT_WAIT_S    = 1.0
 
 # GUI
-TIMEWINDOW_MS          = 60_00  # 6 s visivi (asse X in secondi)
+TIMEWINDOW_MS          = 60_00  # 6 s
 REFRESH_MS             = 60
 
 # CSV: 1 riga ogni 0.5 s
-CSV_BIN_MS            = 500
+CSV_BIN_MS             = 500
 
-# Avvio stream: attendi dati veri entro questo tempo, altrimenti cambia UUID/ri-sottoscrivi
+# Start stream: verifica arrivo dati entro X s
 START_DATA_TIMEOUT_S   = 2.5
 
-# Watchdog durante streaming: se non arrivano dati per N secondi, resubscribe/reconnect
+# Watchdog: se silenzio per X s -> resubscribe/reconnect
 NO_DATA_WATCHDOG_S     = 5.0
-MAX_NOTIFY_RESETS      = 2      # per ogni connessione
-MAX_MIDSTREAM_RECONNECTS = 1    # quante volte può riconnettere a caldo
+MAX_NOTIFY_RESETS      = 2
+MAX_MIDSTREAM_RECONNECTS = 1
 
 # Batteria smoothing
-BAT_UPDATE_MIN_DT      = 1.5    # s
+BAT_UPDATE_MIN_DT      = 1.5
 BAT_EMA_ALPHA          = 0.08
-BAT_MAX_STEP           = 1.0    # % max per update
+BAT_MAX_STEP           = 1.0
 
 # ===================== GUI deps =====================
 import tkinter as tk
@@ -76,7 +76,7 @@ def parse_combined(payload: bytes):
     ax, ay, az, gx, gy, gz = struct.unpack_from("<hhhhhh", payload, 2)
     return ts, ax, ay, az, gx/10.0, gy/10.0, gz/10.0
 
-# Batteria: prova 1B percentuale o 2B mV (3300..4200/4400), fallback % da mV
+# Batteria: 1B percentuale o 2B mV (3300..4400), fallback % da mV
 def parse_battery(payload: bytes):
     b = bytes(payload); pct=None; mv=None
     for i in range(len(b)):
@@ -100,7 +100,7 @@ class SlewEMA:
         self.last = cand; self.last_ui_t = now
         return self.last
 
-# ===================== Pre-scan Windows: trova *due* device distinti =====================
+# ===================== Prescan Windows (non bloccante) =====================
 def _addr_matches_hint(addr: str, hint: str|None) -> bool:
     if not hint:
         return True
@@ -108,72 +108,70 @@ def _addr_matches_hint(addr: str, hint: str|None) -> bool:
     h = hint.lower()
     return (a == h) or (h in a)  # consente match parziale/suffisso
 
-async def scan_collect(service_uuid=BLUEST_SERVICE, seconds=8.0):
+def _name_looks_like_stb(name: str|None) -> bool:
+    if not name: return False
+    n = name.lower()
+    return ("stb" in n) or ("pro" in n) or ("tile" in n)
+
+async def scan_collect(seconds=6.0):
     """
-    Colleziona annunci BLE per 'seconds'. Filtra per service_uuid se presente.
-    Ritorna lista di tuple (device, adv) senza duplicati per address, ordinata per RSSI decrescente.
+    Colleziona advertising BLE per 'seconds'.
+    Nessun filtro su UUID servizio (su Windows spesso non è presente).
+    Restituisce lista (dev, adv) senza duplicati per address, ordinati per RSSI decrescente.
     """
     found = {}  # address -> (dev, adv)
-
     def cb(dev, adv):
-        su = set(adv.service_uuids or [])
-        if service_uuid and (service_uuid.lower() not in {s.lower() for s in su}):
-            return
-        found[dev.address] = (dev, adv)  # mantieni ultimo (RSSI aggiornato)
-
+        found[dev.address] = (dev, adv)  # mantieni l’ultimo (RSSI aggiornato)
     async with BleakScanner(detection_callback=cb) as s:
         await asyncio.sleep(seconds)
-
     items = list(found.values())
     items.sort(key=lambda da: (da[1].rssi or -999), reverse=True)
     return items
 
 async def find_two_distinct_devices(addr1_hint: str|None, addr2_hint: str|None,
-                                    rounds: int = 3, seconds_per_round: float = 6.0):
+                                    rounds: int = 2, seconds_per_round: float = 5.0):
     """
-    Restituisce due BLEDevice distinti (dev1, dev2) cercandoli in max 'rounds'.
-    - Filtra per service BlueST
-    - Matcha addr1_hint e addr2_hint (interi o suffisso)
-    - Se non trova entrambi, estende durata e riprova
+    Ritorna (dev1, dev2) provando:
+      1) match esplicito con hint 1 e 2 (anche parziali)
+      2) se non basta, selezione dei primi due più forti simili a "stb"
+      3) se ancora non basta, i primi due per RSSI
     """
-    dev1 = None; dev2 = None
     for _ in range(rounds):
-        items = await scan_collect(BLUEST_SERVICE, seconds=seconds_per_round)
+        items = await scan_collect(seconds=seconds_per_round)
+        # — 1) match sugli hint
         cand1 = None; cand2 = None
-
-        # prova match esplicito vs hint
         for dev, adv in items:
+            name = (dev.name or getattr(adv, "local_name", None) or "")
             if cand1 is None and _addr_matches_hint(dev.address, addr1_hint):
                 cand1 = dev
             if cand2 is None and _addr_matches_hint(dev.address, addr2_hint) and (cand1 is None or dev.address != cand1.address):
                 cand2 = dev
             if cand1 and cand2 and cand1.address != cand2.address:
-                break
+                return cand1, cand2
 
-        # fallback: prendi i primi due distinti per RSSI
-        if (cand1 is None or cand2 is None) and len(items) >= 2:
-            distinct = []
-            for dev, adv in items:
-                if all(dev.address != d.address for d in distinct):
-                    distinct.append(dev)
-                if len(distinct) >= 2: break
-            if cand1 is None and len(distinct) >= 1: cand1 = distinct[0]
-            if cand2 is None and len(distinct) >= 2 and distinct[1].address != cand1.address: cand2 = distinct[1]
+        # — 2) primi due che “sembrano” STB
+        stb_like = [dev for dev, adv in items if _name_looks_like_stb(dev.name or getattr(adv, "local_name", None))]
+        if len(stb_like) >= 2:
+            if stb_like[0].address != stb_like[1].address:
+                return stb_like[0], stb_like[1]
 
-        if cand1 and cand2 and cand1.address != cand2.address:
-            dev1, dev2 = cand1, cand2
-            break
+        # — 3) fallback: primi due per RSSI distinti
+        if len(items) >= 2:
+            d0 = items[0][0]
+            for dev, adv in items[1:]:
+                if dev.address != d0.address:
+                    return d0, dev
 
-        seconds_per_round += 3.0  # allunga lo scan e riprova
+        seconds_per_round += 3.0
 
-    return dev1, dev2
+    return None, None
 
 # ===================== BLE Worker =====================
 @dataclass
 class DevCfg:
     id: int
     addr: str
-    combined_uuid: str | None  # preferita
+    combined_uuid: str | None
 
 class BLEWorker(threading.Thread):
     def __init__(self, cfg: DevCfg, ui_queue, stop_event, start_barrier, status_cb):
@@ -191,7 +189,7 @@ class BLEWorker(threading.Thread):
         self.last_data_t = 0.0
         self.notify_resets = 0
         self.midstream_reconnects = 0
-        self.started_once = False  # primo campione arrivato
+        self.started_once = False
 
     def log(self, msg): self.status_cb(self.cfg.id, msg)
 
@@ -219,12 +217,10 @@ class BLEWorker(threading.Thread):
                     await asyncio.sleep(backoff)
         raise last_exc if last_exc else RuntimeError("Connessione fallita")
 
-    # --- callback batteria ---
     def _on_bat(self, _h, data: bytearray):
         pct, mv = parse_battery(data)
         self.uiq.put(("bat", self.cfg.id, pct, mv, time.time()))
 
-    # --- callback combined ---
     def _on_combined(self, _h, data: bytearray):
         p = parse_combined(data)
         if not p: return
@@ -233,7 +229,7 @@ class BLEWorker(threading.Thread):
         self.last_data_t = now
         if not self.started_once:
             self.started_once = True
-            self.uiq.put(("ready", self.cfg.id))  # segnala readiness sul primo dato reale
+            self.uiq.put(("ready", self.cfg.id))
             self.log(f"Dati ricevuti su {self.active_uuid}")
         self.uiq.put(("accgyr", self.cfg.id, now, ts, ax, ay, az, gx, gy, gz))
 
@@ -286,7 +282,6 @@ class BLEWorker(threading.Thread):
         silent_for = (now - self.last_data_t) if self.last_data_t > 0 else NO_DATA_WATCHDOG_S + 1
         if silent_for <= NO_DATA_WATCHDOG_S:
             return True
-        # muto: prova resubscribe
         if self.notify_resets < MAX_NOTIFY_RESETS:
             self.notify_resets += 1
             self.log(f"Watchdog: nessun dato da {silent_for:.1f}s → riattivo notify ({self.notify_resets}/{MAX_NOTIFY_RESETS})…")
@@ -296,11 +291,10 @@ class BLEWorker(threading.Thread):
                     except Exception: pass
                 ok = await self._start_combined_with_fallbacks()
                 if ok:
-                    self.log("Notify riattivata con successo.")
+                    self.log("Notify riattivata.")
                     return True
             except Exception as e:
                 self.log(f"(resubscribe fallita: {e})")
-        # riconnessione mid-stream
         if self.midstream_reconnects < MAX_MIDSTREAM_RECONNECTS:
             self.midstream_reconnects += 1
             self.log("Watchdog: riconnessione a caldo…")
@@ -383,14 +377,14 @@ class App:
         self.ready = set()
         self.closing = False
 
-        # timeline globale continua
+        # timeline continua
         self.t0 = None
         self.t_last_global = 0
 
-        # CSV bins da 0.5 s per device
+        # CSV bins
         self.csv_bins = {1: {}, 2: {}}
 
-        # filtri batteria
+        # batteria
         self.bat_filters = {1: SlewEMA(), 2: SlewEMA()}
 
         # CSV path
@@ -408,7 +402,7 @@ class App:
         self.lbl_s2  = ttk.Label(top, text="Stato #2: —"); self.lbl_s2.pack(side="left", padx=10)
         self.lbl_b2  = ttk.Label(top, text="Batteria #2: —"); self.lbl_b2.pack(side="left", padx=6)
 
-        # ===== Corpo: sinistra grafici, destra tabelle =====
+        # ===== Corpo =====
         body = ttk.Frame(root, padding=6); body.pack(fill="both", expand=True)
 
         self.fig = Figure(figsize=(9.0, 6.8), dpi=100)
@@ -426,7 +420,7 @@ class App:
         self.tree1 = self._make_table(right, "ACC/GYR #1 — ultimi 50")
         self.tree2 = self._make_table(right, "ACC/GYR #2 — ultimi 50")
 
-        # buffer plotting per device
+        # buffer plotting
         self.buff = {
             1: {k: deque(maxlen=TIMEWINDOW_MS) for k in ["t","ax","ay","az","gx","gy","gz"]},
             2: {k: deque(maxlen=TIMEWINDOW_MS) for k in ["t","ax","ay","az","gx","gy","gz"]},
@@ -486,6 +480,16 @@ class App:
             if t: last = max(last, t[-1])
         return last
 
+    # ====== Prescan async (non blocca GUI) ======
+    def _prescan_thread_target(self, addr1_hint, addr2_hint):
+        try:
+            dev1, dev2 = asyncio.run(find_two_distinct_devices(addr1_hint, addr2_hint, rounds=2, seconds_per_round=5.0))
+            a1 = dev1.address if dev1 else None
+            a2 = dev2.address if dev2 else None
+            self.uiq.put(("resolved", a1, a2))
+        except Exception as e:
+            self.uiq.put(("resolved", None, None))
+
     # ====== Pulsanti ======
     def on_connect(self):
         if self.closing: return
@@ -494,43 +498,29 @@ class App:
         self._set_state(1, "Risoluzione device…"); self._set_state(2, "Risoluzione device…")
         self._set_bat(1, None, None); self._set_bat(2, None, None)
         self.ready.clear(); self.stop_event.clear()
-        # reset CSV bins
         self.csv_bins = {1: {}, 2: {}}
         self.bat_filters = {1: SlewEMA(), 2: SlewEMA()}
         self.csv_path = (Path.home()/ "Desktop" / f"stbpro_dual_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
 
-        # timeline continua: NON azzero i buffer; mantengo X continua
+        # timeline continua
         self.t_last_global = self._global_last_time()
         epsilon = 0.02
         self.t0 = time.time() - (self.t_last_global + epsilon)
 
-        # ---- NUOVO: pre-scan (solo Windows) per trovare DUE device distinti
-        def _resolve_both_blocking():
-            if sys.platform != "win32":
-                return None, None
-            addr1_hint = ADDR_1
-            addr2_hint = ADDR_2
-            return asyncio.run(find_two_distinct_devices(addr1_hint, addr2_hint,
-                                                         rounds=3, seconds_per_round=6.0))
-        dev1, dev2 = _resolve_both_blocking()
         if sys.platform == "win32":
-            if not (dev1 and dev2):
-                self._set_general("Errore: non trovati entrambi in scansione.")
-                self._set_state(1, "Non trovato"); self._set_state(2, "Non trovato")
-                self.btn_conn.configure(state="normal")
-                return
-            resolved_addr1 = dev1.address
-            resolved_addr2 = dev2.address
-            self._set_state(1, f"Trovato {resolved_addr1}")
-            self._set_state(2, f"Trovato {resolved_addr2}")
+            # avvia prescan in thread separato
+            t = threading.Thread(target=self._prescan_thread_target, args=(ADDR_1, ADDR_2), daemon=True)
+            t.start()
         else:
-            resolved_addr1 = ADDR_1
-            resolved_addr2 = ADDR_2
+            # no-prescan: usa indirizzi noti
+            self._start_workers(ADDR_1, ADDR_2)
 
-        # barriera & workers
+    def _start_workers(self, addr1, addr2):
+        self._set_state(1, f"Trovato {addr1}")
+        self._set_state(2, f"Trovato {addr2}")
         self.barrier = threading.Barrier(2)
-        w1 = BLEWorker(DevCfg(1, resolved_addr1, COMBINED_UUID_1), self.uiq, self.stop_event, self.barrier, self._set_state)
-        w2 = BLEWorker(DevCfg(2, resolved_addr2, COMBINED_UUID_2), self.uiq, self.stop_event, self.barrier, self._set_state)
+        w1 = BLEWorker(DevCfg(1, addr1, COMBINED_UUID_1), self.uiq, self.stop_event, self.barrier, self._set_state)
+        w2 = BLEWorker(DevCfg(2, addr2, COMBINED_UUID_2), self.uiq, self.stop_event, self.barrier, self._set_state)
         self.workers = [w1, w2]
         for w in self.workers: w.start()
 
@@ -559,7 +549,7 @@ class App:
         for w in self.workers:
             try: w.join(timeout=2.0)
             except Exception: pass
-        try: self._save_merged_csv_0p5s()
+        try: self._save_merged_csv_0.5s()
         except Exception: pass
         try: self.root.destroy()
         except Exception: pass
@@ -570,11 +560,24 @@ class App:
             while True:
                 item = self.uiq.get_nowait()
                 kind = item[0]
-                if kind == "ready":
+
+                if kind == "resolved":
+                    # arriva dal thread di prescan (solo Win)
+                    _, a1, a2 = item
+                    if (a1 is None) or (a2 is None):
+                        # fallback: usa gli indirizzi noti
+                        self._set_general("Prescan fallito, uso indirizzi noti.")
+                        a1 = ADDR_1; a2 = ADDR_2
+                    else:
+                        self._set_general("Device risolti. Connessione…")
+                    self._start_workers(a1, a2)
+
+                elif kind == "ready":
                     self.ready.add(item[1])
                     if len(self.ready) == 2:
                         self.btn_stop.configure(state="normal")
                         self._set_general("Streaming")
+
                 elif kind == "bat":
                     _, dev_id, pct, mv, tnow = item
                     if pct is not None: pct = clamp(pct, 0.0, 100.0)
@@ -582,6 +585,7 @@ class App:
                     if tnow - filt.last_ui_t >= BAT_UPDATE_MIN_DT or filt.last_ui_t == 0.0:
                         spct = filt.update(pct, tnow)
                         self._set_bat(dev_id, spct, mv)
+
                 elif kind == "accgyr":
                     _, dev_id, t_host, ts_ble, ax, ay, az, gx, gy, gz = item
                     if self.t0 is None:
@@ -599,6 +603,7 @@ class App:
                     t_ms = int(round(t_s*1000))
                     bin_ms = (t_ms // CSV_BIN_MS) * CSV_BIN_MS
                     self.csv_bins[dev_id][bin_ms] = [ax, ay, az, gx, gy, gz]
+
         except queue.Empty:
             pass
 
@@ -607,7 +612,7 @@ class App:
             B = self.buff[dev_id]; t=list(B["t"])
             if not t: continue
             tmax = t[-1]; tmin = max(0.0, tmax - TIMEWINDOW_MS/1000.0)
-            # indice primo dentro finestra
+            # primo indice dentro finestra
             i0 = 0
             for k in range(len(t)-1, -1, -1):
                 if t[k] < tmin: i0 = k+1; break
