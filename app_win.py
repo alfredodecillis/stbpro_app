@@ -1,14 +1,14 @@
-# stbpro_dual_sync_ui_v3_watchdog_winprescan_fix.py
-# - GUI invariata (4 grafici: ACC/GYR #1 e #2 a sinistra; 2 tabelle a destra)
-# - Stato generale + stati per #1 e #2
-# - Start sincronizzato SOLO dopo il primo campione di entrambi
-# - CSV: 1 riga ogni 0.5 s, timeline regolare (hold-last-value)
-# - Connessione: ritentativi + watchdog no-data (resubscribe/reconnect)
-# - Batteria: EMA + slew-rate + rate limit per evitare salti
-# - Prescan Windows NON BLOCCANTE con fallback agli indirizzi noti
-# - Prescan senza filtro per UUID di servizio (alcuni advertising non lo includono su Win)
+# stbpro_dual_sync_ui_v4_windows_fix.py
+# - GUI invariata (4 grafici a sinistra; 2 tabelle a destra; stati in alto)
+# - Start sincronizzato SOLO dopo il primo campione da entrambi
+# - CSV: 1 riga/0.5 s, hold-last-value
+# - Connessione robusta: timeout "duro" + retry/backoff
+# - Windows: risoluzione BLEDevice via scan (evita hang su connect con address RPA)
+# - Avvio connessioni sfalsato (riduce lock del controller BT)
+# - Watchdog no-data: resubscribe / reconnect
+# - Batteria: EMA + slew limit
 
-import sys, asyncio, struct, time, csv, os, threading, queue
+import asyncio, struct, time, csv, os, threading, queue, contextlib, sys
 from collections import deque, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -16,17 +16,18 @@ from pathlib import Path
 from bleak import BleakClient, BleakScanner
 
 # ===================== CONFIG =====================
-ADDR_1 = "3718ACE8-DF5F-6A95-C883-B0A70601A2F7"  # STB_PRO #1 (hint address; ok anche suffisso)
-ADDR_2 = "51C9EADA-28B1-2EAF-8711-E411311F64EA"  # STB_PRO #2 (hint address; ok anche suffisso)
+ADDR_1 = "3718ACE8-DF5F-6A95-C883-B0A70601A2F7"  # STB_PRO #1
+ADDR_2 = "51C9EADA-28B1-2EAF-8711-E411311F64EA"  # STB_PRO #2
 
-# UUID "combined" (ACC+GYR in un frame)
-COMBINED_UUID_1 = "00c00000-0001-11e1-ac36-0002a5d5c51b"  # noto per #1
-COMBINED_UUID_2 = "00e00000-0001-11e1-ac36-0002a5d5c51b"  # noto per #2
+# UUID "combined" (ACC+GYR in un frame) noti per i due device
+COMBINED_UUID_1 = "00c00000-0001-11e1-ac36-0002a5d5c51b"  # #1 noto
+COMBINED_UUID_2 = "00e00000-0001-11e1-ac36-0002a5d5c51b"  # #2 noto
 
-# BlueST battery
-BAT_UUID = "00020000-0001-11e1-ac36-0002a5d5c51b"
+# BlueST
+BLUEST_SERVICE   = "00000000-0001-11e1-9ab4-0002a5d5c51b"
+BAT_UUID         = "00020000-0001-11e1-ac36-0002a5d5c51b"
 
-# Candidati autodetect combined (fallback se la "nota" non manda dati)
+# Combined alternative (fallback)
 COMBINED_CANDIDATES = [
     "00c00000-0001-11e1-ac36-0002a5d5c51b",
     "00e00000-0001-11e1-ac36-0002a5d5c51b",
@@ -35,30 +36,31 @@ COMBINED_CANDIDATES = [
     "00000014-0002-11e1-ac36-0002a5d5c51b",
 ]
 
+# Connessione/Retry
 CONNECT_TIMEOUT_S      = 10
 CONNECT_RETRIES        = 5
 RETRY_BACKOFF_BASE_S   = 1.2
 POST_CONNECT_WAIT_S    = 1.0
 
 # GUI
-TIMEWINDOW_MS          = 60_00  # 6 s
+TIMEWINDOW_MS          = 60_00   # 6 s in finestra
 REFRESH_MS             = 60
 
 # CSV: 1 riga ogni 0.5 s
 CSV_BIN_MS             = 500
 
-# Start stream: verifica arrivo dati entro X s
+# Avvio stream: entro quanto devono arrivare dati dalla combined
 START_DATA_TIMEOUT_S   = 2.5
 
-# Watchdog: se silenzio per X s -> resubscribe/reconnect
-NO_DATA_WATCHDOG_S     = 5.0
-MAX_NOTIFY_RESETS      = 2
+# Watchdog "no data"
+NO_DATA_WATCHDOG_S       = 5.0
+MAX_NOTIFY_RESETS        = 2
 MAX_MIDSTREAM_RECONNECTS = 1
 
 # Batteria smoothing
-BAT_UPDATE_MIN_DT      = 1.5
+BAT_UPDATE_MIN_DT      = 1.5    # s
 BAT_EMA_ALPHA          = 0.08
-BAT_MAX_STEP           = 1.0
+BAT_MAX_STEP           = 1.0    # % per update
 
 # ===================== GUI deps =====================
 import tkinter as tk
@@ -76,7 +78,7 @@ def parse_combined(payload: bytes):
     ax, ay, az, gx, gy, gz = struct.unpack_from("<hhhhhh", payload, 2)
     return ts, ax, ay, az, gx/10.0, gy/10.0, gz/10.0
 
-# Batteria: 1B percentuale o 2B mV (3300..4400), fallback % da mV
+# Batteria: prova 1B percentuale o 2B mV 3300..4400 → fallback % da mV
 def parse_battery(payload: bytes):
     b = bytes(payload); pct=None; mv=None
     for i in range(len(b)):
@@ -100,78 +102,47 @@ class SlewEMA:
         self.last = cand; self.last_ui_t = now
         return self.last
 
-# ===================== Prescan Windows (non bloccante) =====================
-def _addr_matches_hint(addr: str, hint: str|None) -> bool:
-    if not hint:
-        return True
-    a = (addr or "").lower()
-    h = hint.lower()
-    return (a == h) or (h in a)  # consente match parziale/suffisso
-
-def _name_looks_like_stb(name: str|None) -> bool:
-    if not name: return False
-    n = name.lower()
-    return ("stb" in n) or ("pro" in n) or ("tile" in n)
-
-async def scan_collect(seconds=6.0):
+# ===================== Windows: risoluzione BLEDevice via scan =====================
+async def resolve_ble_device_windows(target_hint: str, scan_s: float = 6.0):
     """
-    Colleziona advertising BLE per 'seconds'.
-    Nessun filtro su UUID servizio (su Windows spesso non è presente).
-    Restituisce lista (dev, adv) senza duplicati per address, ordinati per RSSI decrescente.
+    Ritorna un BLEDevice su Windows cercando per:
+      - match esatto address
+      - match su suffisso address
+      - nome contenente 'stb_pro' con hint nel nome o address
+    Ordinati per RSSI decrescente.
+    Su macOS/Linux ritorna None.
     """
-    found = {}  # address -> (dev, adv)
-    def cb(dev, adv):
-        found[dev.address] = (dev, adv)  # mantieni l’ultimo (RSSI aggiornato)
-    async with BleakScanner(detection_callback=cb) as s:
-        await asyncio.sleep(seconds)
-    items = list(found.values())
-    items.sort(key=lambda da: (da[1].rssi or -999), reverse=True)
-    return items
+    if sys.platform != "win32":
+        return None
 
-async def find_two_distinct_devices(addr1_hint: str|None, addr2_hint: str|None,
-                                    rounds: int = 2, seconds_per_round: float = 5.0):
-    """
-    Ritorna (dev1, dev2) provando:
-      1) match esplicito con hint 1 e 2 (anche parziali)
-      2) se non basta, selezione dei primi due più forti simili a "stb"
-      3) se ancora non basta, i primi due per RSSI
-    """
-    for _ in range(rounds):
-        items = await scan_collect(seconds=seconds_per_round)
-        # — 1) match sugli hint
-        cand1 = None; cand2 = None
-        for dev, adv in items:
-            name = (dev.name or getattr(adv, "local_name", None) or "")
-            if cand1 is None and _addr_matches_hint(dev.address, addr1_hint):
-                cand1 = dev
-            if cand2 is None and _addr_matches_hint(dev.address, addr2_hint) and (cand1 is None or dev.address != cand1.address):
-                cand2 = dev
-            if cand1 and cand2 and cand1.address != cand2.address:
-                return cand1, cand2
+    hint = (target_hint or "").lower()
+    async with BleakScanner() as scanner:
+        await asyncio.sleep(scan_s)
+        pairs = list(scanner.discovered_devices_and_advertisement_data.values())
 
-        # — 2) primi due che “sembrano” STB
-        stb_like = [dev for dev, adv in items if _name_looks_like_stb(dev.name or getattr(adv, "local_name", None))]
-        if len(stb_like) >= 2:
-            if stb_like[0].address != stb_like[1].address:
-                return stb_like[0], stb_like[1]
+    # sort per RSSI (prima i migliori)
+    try:
+        pairs.sort(key=lambda p: getattr(p[1], "rssi", -9999), reverse=True)
+    except Exception:
+        pass
 
-        # — 3) fallback: primi due per RSSI distinti
-        if len(items) >= 2:
-            d0 = items[0][0]
-            for dev, adv in items[1:]:
-                if dev.address != d0.address:
-                    return d0, dev
-
-        seconds_per_round += 3.0
-
-    return None, None
+    for dev, adv in pairs:
+        name = (dev.name or getattr(adv, "local_name", None) or "").lower()
+        addr = (dev.address or "").lower()
+        if hint and addr == hint:
+            return dev
+        if hint and len(hint) >= 6 and addr.endswith(hint[-6:]):
+            return dev
+        if "stb_pro" in name and (not hint or hint in name or hint in addr):
+            return dev
+    return None
 
 # ===================== BLE Worker =====================
 @dataclass
 class DevCfg:
     id: int
     addr: str
-    combined_uuid: str | None
+    combined_uuid: str | None  # preferita
 
 class BLEWorker(threading.Thread):
     def __init__(self, cfg: DevCfg, ui_queue, stop_event, start_barrier, status_cb):
@@ -184,6 +155,7 @@ class BLEWorker(threading.Thread):
         self.client: BleakClient | None = None
         self.preferred_uuid = cfg.combined_uuid
         self.active_uuid = None
+        self.ble_target = None  # string address o BLEDevice (Windows)
 
         # watchdog
         self.last_data_t = 0.0
@@ -194,33 +166,54 @@ class BLEWorker(threading.Thread):
     def log(self, msg): self.status_cb(self.cfg.id, msg)
 
     async def _connect_with_retries(self):
+        """
+        Connessione robusta con deadline dura: se connect non termina entro CONNECT_TIMEOUT_S,
+        forziamo disconnect e retry con backoff.
+        """
         last_exc = None
         for attempt in range(1, CONNECT_RETRIES + 1):
-            self.log(f"Connessione a {self.cfg.addr} (tentativo {attempt}/{CONNECT_RETRIES}, timeout {CONNECT_TIMEOUT_S}s)…")
-            cl = BleakClient(self.cfg.addr, disconnected_callback=lambda c: self.log("Disconnesso."))
+            target = self.ble_target or self.cfg.addr
+            self.log(f"Connessione a {target} (tentativo {attempt}/{CONNECT_RETRIES}, timeout {CONNECT_TIMEOUT_S}s)…")
+            cl = BleakClient(target, disconnected_callback=lambda c: self.log("Disconnesso."))
             try:
-                await asyncio.wait_for(cl.connect(), timeout=CONNECT_TIMEOUT_S)
+                task = asyncio.create_task(cl.connect())
+                done, _ = await asyncio.wait({task}, timeout=CONNECT_TIMEOUT_S)
+                if not done:
+                    self.log("Timeout connect: forzo disconnect e riprovo…")
+                    with contextlib.suppress(Exception):
+                        await cl.disconnect()
+                    with contextlib.suppress(Exception):
+                        task.cancel(); await task
+                    raise asyncio.TimeoutError("Connect deadline exceeded")
+
+                # task completato (ok/errore)
+                await task  # rilancia eventuale eccezione
                 await asyncio.sleep(POST_CONNECT_WAIT_S)
-                try: await asyncio.wait_for(cl.get_services(), timeout=5)
-                except Exception: pass
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(cl.get_services(), timeout=5)
+
                 self.client = cl
                 self.log("Connesso.")
                 return
+
             except Exception as e:
                 last_exc = e
                 self.log(f"Errore: {type(e).__name__}: {e}")
-                try: await cl.disconnect()
-                except Exception: pass
+                with contextlib.suppress(Exception):
+                    await cl.disconnect()
                 if attempt < CONNECT_RETRIES:
                     backoff = RETRY_BACKOFF_BASE_S * attempt
                     self.log(f"Riprovo tra {backoff:.1f}s…")
                     await asyncio.sleep(backoff)
+
         raise last_exc if last_exc else RuntimeError("Connessione fallita")
 
+    # BAT callback
     def _on_bat(self, _h, data: bytearray):
         pct, mv = parse_battery(data)
         self.uiq.put(("bat", self.cfg.id, pct, mv, time.time()))
 
+    # Combined callback
     def _on_combined(self, _h, data: bytearray):
         p = parse_combined(data)
         if not p: return
@@ -234,11 +227,9 @@ class BLEWorker(threading.Thread):
         self.uiq.put(("accgyr", self.cfg.id, now, ts, ax, ay, az, gx, gy, gz))
 
     async def _start_bat_notify(self):
-        try:
+        with contextlib.suppress(Exception):
             await asyncio.wait_for(self.client.start_notify(BAT_UUID, self._on_bat), timeout=4)
             self.log("notify BAT ON")
-        except Exception as e:
-            self.log(f"(BAT notify fallita: {e})")
 
     async def _try_start_combined(self, uuid):
         self.log(f"Tento combined su {uuid}…")
@@ -259,8 +250,8 @@ class BLEWorker(threading.Thread):
             return True
         except asyncio.TimeoutError:
             self.log(f"Nessun dato entro {START_DATA_TIMEOUT_S}s su {uuid}.")
-            try: await self.client.stop_notify(uuid)
-            except Exception: pass
+            with contextlib.suppress(Exception):
+                await self.client.stop_notify(uuid)
             return False
 
     async def _start_combined_with_fallbacks(self):
@@ -282,31 +273,33 @@ class BLEWorker(threading.Thread):
         silent_for = (now - self.last_data_t) if self.last_data_t > 0 else NO_DATA_WATCHDOG_S + 1
         if silent_for <= NO_DATA_WATCHDOG_S:
             return True
+        # resubscribe
         if self.notify_resets < MAX_NOTIFY_RESETS:
             self.notify_resets += 1
             self.log(f"Watchdog: nessun dato da {silent_for:.1f}s → riattivo notify ({self.notify_resets}/{MAX_NOTIFY_RESETS})…")
             try:
                 if self.active_uuid:
-                    try: await self.client.stop_notify(self.active_uuid)
-                    except Exception: pass
+                    with contextlib.suppress(Exception):
+                        await self.client.stop_notify(self.active_uuid)
                 ok = await self._start_combined_with_fallbacks()
                 if ok:
                     self.log("Notify riattivata.")
                     return True
             except Exception as e:
                 self.log(f"(resubscribe fallita: {e})")
+        # reconnect
         if self.midstream_reconnects < MAX_MIDSTREAM_RECONNECTS:
             self.midstream_reconnects += 1
             self.log("Watchdog: riconnessione a caldo…")
             try:
-                try: await self.client.disconnect()
-                except Exception: pass
+                with contextlib.suppress(Exception):
+                    await self.client.disconnect()
                 await self._connect_with_retries()
                 await self._start_bat_notify()
                 ok = await self._start_combined_with_fallbacks()
                 if ok:
                     self.notify_resets = 0
-                    self.log("Riconnesso e notify attiva.")
+                    self.log("Riconnesso e streaming attivo.")
                     return True
             except Exception as e:
                 self.log(f"(riconnessione fallita: {e})")
@@ -314,42 +307,57 @@ class BLEWorker(threading.Thread):
         return False
 
     async def run_async(self):
+        # 0) Risoluzione BLEDevice su Windows
+        try:
+            dev = await resolve_ble_device_windows(self.cfg.addr, scan_s=6.0)
+            if dev:
+                self.ble_target = dev
+                self.log(f"Device risolto: {dev.address} ({dev.name or '—'})")
+            else:
+                self.ble_target = self.cfg.addr
+                self.log("Device non risolto via scan: uso address diretto.")
+        except Exception as e:
+            self.ble_target = self.cfg.addr
+            self.log(f"(scan risoluzione fallita: {e})")
+
+        # 1) Connect robusto
         try:
             await self._connect_with_retries()
         except Exception as e:
             self.log(f"Errore connessione: {e}")
             return
 
+        # 2) Barriera: aspetta l'altro device
         try:
             self.log("In attesa dell’altro device…")
             self.barrier.wait(timeout=15)
         except Exception:
             self.log("⚠️ Barriera non raggiunta: avvio comunque.")
 
+        # 3) BAT + Combined con verifica dati
         await self._start_bat_notify()
         ok = await self._start_combined_with_fallbacks()
         if not ok:
             self.log("⚠️ Nessuna stream accesa (combined). Chiudo.")
             return
 
+        # 4) Loop watchdog/stop
         while not self.stop_event.is_set():
             ok = await self._ensure_streaming()
             if not ok:
                 break
             await asyncio.sleep(0.2)
 
+        # 5) cleanup
         try:
             if self.client:
-                try:
-                    if self.active_uuid:
+                if self.active_uuid:
+                    with contextlib.suppress(Exception):
                         await self.client.stop_notify(self.active_uuid)
-                except Exception: pass
-                try:
+                with contextlib.suppress(Exception):
                     await self.client.stop_notify(BAT_UUID)
-                except Exception: pass
-                try:
+                with contextlib.suppress(Exception):
                     await self.client.disconnect()
-                except Exception: pass
         except Exception:
             pass
         self.log("Chiuso.")
@@ -360,8 +368,9 @@ class BLEWorker(threading.Thread):
         try:
             loop.run_until_complete(self.run_async())
         finally:
-            try: loop.stop()
-            finally: loop.close()
+            with contextlib.suppress(Exception):
+                loop.stop()
+                loop.close()
 
 # ===================== APP =====================
 class App:
@@ -377,11 +386,11 @@ class App:
         self.ready = set()
         self.closing = False
 
-        # timeline continua
+        # timeline globale continua
         self.t0 = None
         self.t_last_global = 0
 
-        # CSV bins
+        # CSV bins 0.5 s
         self.csv_bins = {1: {}, 2: {}}
 
         # batteria
@@ -402,7 +411,7 @@ class App:
         self.lbl_s2  = ttk.Label(top, text="Stato #2: —"); self.lbl_s2.pack(side="left", padx=10)
         self.lbl_b2  = ttk.Label(top, text="Batteria #2: —"); self.lbl_b2.pack(side="left", padx=6)
 
-        # ===== Corpo =====
+        # ===== Corpo: sinistra grafici, destra tabelle =====
         body = ttk.Frame(root, padding=6); body.pack(fill="both", expand=True)
 
         self.fig = Figure(figsize=(9.0, 6.8), dpi=100)
@@ -420,7 +429,7 @@ class App:
         self.tree1 = self._make_table(right, "ACC/GYR #1 — ultimi 50")
         self.tree2 = self._make_table(right, "ACC/GYR #2 — ultimi 50")
 
-        # buffer plotting
+        # buffer plotting per device
         self.buff = {
             1: {k: deque(maxlen=TIMEWINDOW_MS) for k in ["t","ax","ay","az","gx","gy","gz"]},
             2: {k: deque(maxlen=TIMEWINDOW_MS) for k in ["t","ax","ay","az","gx","gy","gz"]},
@@ -480,60 +489,43 @@ class App:
             if t: last = max(last, t[-1])
         return last
 
-    # ====== Prescan async (non blocca GUI) ======
-    def _prescan_thread_target(self, addr1_hint, addr2_hint):
-        try:
-            dev1, dev2 = asyncio.run(find_two_distinct_devices(addr1_hint, addr2_hint, rounds=2, seconds_per_round=5.0))
-            a1 = dev1.address if dev1 else None
-            a2 = dev2.address if dev2 else None
-            self.uiq.put(("resolved", a1, a2))
-        except Exception as e:
-            self.uiq.put(("resolved", None, None))
-
     # ====== Pulsanti ======
     def on_connect(self):
         if self.closing: return
         self._set_general("Connessione…")
         self.btn_conn.configure(state="disabled"); self.btn_stop.configure(state="disabled")
-        self._set_state(1, "Risoluzione device…"); self._set_state(2, "Risoluzione device…")
+        self._set_state(1, "Connessione…"); self._set_state(2, "Connessione…")
         self._set_bat(1, None, None); self._set_bat(2, None, None)
         self.ready.clear(); self.stop_event.clear()
         self.csv_bins = {1: {}, 2: {}}
         self.bat_filters = {1: SlewEMA(), 2: SlewEMA()}
         self.csv_path = (Path.home()/ "Desktop" / f"stbpro_dual_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
 
-        # timeline continua
+        # timeline continua (no scatto all'indietro)
         self.t_last_global = self._global_last_time()
         epsilon = 0.02
         self.t0 = time.time() - (self.t_last_global + epsilon)
 
-        if sys.platform == "win32":
-            # avvia prescan in thread separato
-            t = threading.Thread(target=self._prescan_thread_target, args=(ADDR_1, ADDR_2), daemon=True)
-            t.start()
-        else:
-            # no-prescan: usa indirizzi noti
-            self._start_workers(ADDR_1, ADDR_2)
-
-    def _start_workers(self, addr1, addr2):
-        self._set_state(1, f"Trovato {addr1}")
-        self._set_state(2, f"Trovato {addr2}")
+        # barriera & workers
         self.barrier = threading.Barrier(2)
-        w1 = BLEWorker(DevCfg(1, addr1, COMBINED_UUID_1), self.uiq, self.stop_event, self.barrier, self._set_state)
-        w2 = BLEWorker(DevCfg(2, addr2, COMBINED_UUID_2), self.uiq, self.stop_event, self.barrier, self._set_state)
+        w1 = BLEWorker(DevCfg(1, ADDR_1, COMBINED_UUID_1), self.uiq, self.stop_event, self.barrier, self._set_state)
+        w2 = BLEWorker(DevCfg(2, ADDR_2, COMBINED_UUID_2), self.uiq, self.stop_event, self.barrier, self._set_state)
         self.workers = [w1, w2]
-        for w in self.workers: w.start()
+
+        # avvio sfalsato: #1 ora, #2 tra 1.5 s
+        w1.start()
+        self.root.after(1500, lambda: w2.start())
 
     def on_stop(self):
         if self.closing: return
-        try: self.root.after_cancel(self._after)
-        except Exception: pass
+        with contextlib.suppress(Exception):
+            self.root.after_cancel(self._after)
         self.stop_event.set()
         for w in self.workers:
-            try: w.join(timeout=2.0)
-            except Exception: pass
-        try: self._save_merged_csv_0p5s()
-        except Exception as e: print("(CSV fallito)", e)
+            with contextlib.suppress(Exception):
+                w.join(timeout=2.0)
+        with contextlib.suppress(Exception):
+            self._save_merged_csv_0p5s()
         self._set_state(1, "Disconnesso."); self._set_state(2, "Disconnesso.")
         self._set_general("Arrestato")
         self.btn_conn.configure(state="normal"); self.btn_stop.configure(state="disabled")
@@ -542,17 +534,17 @@ class App:
     def on_close(self):
         if self.closing: return
         self.closing = True
-        try: self.root.after_cancel(self._after)
-        except Exception: pass
+        with contextlib.suppress(Exception):
+            self.root.after_cancel(self._after)
         self._set_general("Chiusura…")
         self.stop_event.set()
         for w in self.workers:
-            try: w.join(timeout=2.0)
-            except Exception: pass
-        try: self._save_merged_csv_0p5s()
-        except Exception: pass
-        try: self.root.destroy()
-        except Exception: pass
+            with contextlib.suppress(Exception):
+                w.join(timeout=2.0)
+        with contextlib.suppress(Exception):
+            self._save_merged_csv_0p5s()
+        with contextlib.suppress(Exception):
+            self.root.destroy()
 
     # ====== Main refresh ======
     def refresh(self):
@@ -560,24 +552,11 @@ class App:
             while True:
                 item = self.uiq.get_nowait()
                 kind = item[0]
-
-                if kind == "resolved":
-                    # arriva dal thread di prescan (solo Win)
-                    _, a1, a2 = item
-                    if (a1 is None) or (a2 is None):
-                        # fallback: usa gli indirizzi noti
-                        self._set_general("Prescan fallito, uso indirizzi noti.")
-                        a1 = ADDR_1; a2 = ADDR_2
-                    else:
-                        self._set_general("Device risolti. Connessione…")
-                    self._start_workers(a1, a2)
-
-                elif kind == "ready":
+                if kind == "ready":
                     self.ready.add(item[1])
                     if len(self.ready) == 2:
                         self.btn_stop.configure(state="normal")
                         self._set_general("Streaming")
-
                 elif kind == "bat":
                     _, dev_id, pct, mv, tnow = item
                     if pct is not None: pct = clamp(pct, 0.0, 100.0)
@@ -585,7 +564,6 @@ class App:
                     if tnow - filt.last_ui_t >= BAT_UPDATE_MIN_DT or filt.last_ui_t == 0.0:
                         spct = filt.update(pct, tnow)
                         self._set_bat(dev_id, spct, mv)
-
                 elif kind == "accgyr":
                     _, dev_id, t_host, ts_ble, ax, ay, az, gx, gy, gz = item
                     if self.t0 is None:
@@ -595,15 +573,15 @@ class App:
                     B["t"].append(t_s)
                     B["ax"].append(ax); B["ay"].append(ay); B["az"].append(az)
                     B["gx"].append(gx); B["gy"].append(gy); B["gz"].append(gz)
+                    # tabella
                     tree = self.tree1 if dev_id==1 else self.tree2
                     tree.insert("", "end", values=(f"{t_s:7.2f}", ax, ay, az, f"{gx:.1f}", f"{gy:.1f}", f"{gz:.1f}"))
                     ch = tree.get_children()
                     if len(ch) > 50: tree.delete(ch[0])
-                    # CSV a 0.5 s: ultimo del bin
+                    # CSV 0.5 s (ultimo nel bin)
                     t_ms = int(round(t_s*1000))
                     bin_ms = (t_ms // CSV_BIN_MS) * CSV_BIN_MS
                     self.csv_bins[dev_id][bin_ms] = [ax, ay, az, gx, gy, gz]
-
         except queue.Empty:
             pass
 
