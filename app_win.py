@@ -1,10 +1,9 @@
-# stbpro_dual_sync_ui_v7_perf.py
-# - Stessa UI/flow della v7_autoretry
-# - Ottimizzazioni anti-lag:
-#   * WindowsSelectorEventLoopPolicy su win32
-#   * Throttling: plot/table/ylim con cadenze separate
-#   * Drain coda limitato per evitare starvation della GUI
-#   * Min/Max senza concatenare liste; linee senza antialias
+# stbpro_dual_sync_ui_v8_harddisconnect.py
+# - Force disconnect + (Windows) unpair a ogni Stop/Close
+# - Cooldown prima di riconnettere
+# - Generation token per ignorare callback tardivi post-stop
+# - Throttling + decimazione punti per ridurre lag
+# - UI invariata (4 grafici a sinistra, 2 tabelle a destra), CSV 0.5 s invariato
 
 import sys, asyncio, contextlib, struct, time, csv, os, threading, queue
 from collections import deque, defaultdict
@@ -38,6 +37,7 @@ COMBINED_CANDIDATES = [
     "00000014-0002-11e1-ac36-0002a5d5c51b",
 ]
 
+# Connessione/risoluzione
 CONNECT_TIMEOUT_S        = 10
 POST_CONNECT_WAIT_S      = 1.0
 BARRIER_TIMEOUT_S        = 8.0
@@ -46,19 +46,28 @@ RESOLVE_OVERALL_TIMEOUT  = 35.0
 RESOLVE_BACKOFF_S        = 2.0
 RETRY_BACKOFF_S          = 3.0
 
+# Watchdog & notify
 START_DATA_TIMEOUT_S     = 2.5
 NO_DATA_WATCHDOG_S       = 5.0
 MAX_NOTIFY_RESETS        = 2
 MAX_MIDSTREAM_RECONNECTS = 1
 
+# Disconnessione “pulita”
+UNPAIR_ON_DISCONNECT     = True   # su Windows prova a "dimenticare" il pairing
+COOLDOWN_AFTER_STOP_S    = 1.2    # prima di riavviare connessioni
+
 # === GUI timing ===
 TIMEWINDOW_MS            = 60_00  # 6s
-# Throttling
-PLOT_INTERVAL_S          = 0.08   # ~12.5 FPS (aumenta per più fluido / diminuisci per meno CPU)
-TABLE_INTERVAL_S         = 0.20   # aggiorna tabelle ogni 200 ms
-YLIM_INTERVAL_S          = 0.50   # ricalcola limiti Y ogni 500 ms
 REFRESH_TICK_MS          = 30     # tick della GUI (gestione coda + scheduling)
-MAX_QUEUE_DRAIN_PER_TICK = 600    # evita loop infinito in refresh
+
+# Throttling
+PLOT_INTERVAL_S          = 0.08   # ~12.5 FPS
+TABLE_INTERVAL_S         = 0.20
+YLIM_INTERVAL_S          = 0.50
+MAX_QUEUE_DRAIN_PER_TICK = 600
+
+# Decimazione punti per linea (riduce lag)
+MAX_POINTS_PER_LINE      = 900
 
 # CSV 0.5 s
 CSV_BIN_MS               = 500
@@ -209,7 +218,9 @@ class DevCfg:
     preferred_uuid: str | None
 
 class BLEWorker(threading.Thread):
-    def __init__(self, cfg: DevCfg, uiq: queue.Queue, stop_event: threading.Event, start_barrier: threading.Barrier, status_cb):
+    def __init__(self, cfg: DevCfg, uiq: queue.Queue, stop_event: threading.Event,
+                 start_barrier: threading.Barrier, status_cb, generation: int,
+                 unpair_on_disconnect: bool = UNPAIR_ON_DISCONNECT):
         super().__init__(daemon=True)
         self.cfg = cfg
         self.uiq = uiq
@@ -223,6 +234,8 @@ class BLEWorker(threading.Thread):
         self.notify_resets = 0
         self.midstream_reconnects = 0
         self.started_once = False
+        self.generation = generation
+        self.unpair = unpair_on_disconnect
 
     def log(self, msg): self.status_cb(self.cfg.id, msg)
 
@@ -232,7 +245,6 @@ class BLEWorker(threading.Thread):
         self.log(f"Connessione a {disp} (timeout {CONNECT_TIMEOUT_S}s)…")
 
         cl = BleakClient(target, disconnected_callback=lambda c: self.log("Disconnesso."))
-
         task = asyncio.create_task(cl.connect())
         done, _ = await asyncio.wait({task}, timeout=CONNECT_TIMEOUT_S)
         if not done:
@@ -242,6 +254,7 @@ class BLEWorker(threading.Thread):
         await task
 
         if sys.platform == "win32":
+            # effettua pairing se necessario
             try:
                 paired = await cl.is_paired()
             except Exception:
@@ -256,8 +269,26 @@ class BLEWorker(threading.Thread):
             await asyncio.wait_for(cl.get_services(), timeout=5)
 
         self.client = cl
-        self.uiq.put(("connected", self.cfg.id))
+        self.uiq.put(("connected", self.cfg.id, self.generation))
         self.log("Connesso.")
+
+    async def _hard_close(self):
+        """Stop notify + disconnect + (Windows) unpair per liberare lo stack."""
+        if not self.client: return
+        try:
+            if self.active_uuid:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(self.client.stop_notify(self.active_uuid), timeout=2)
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self.client.stop_notify(BAT_UUID), timeout=2)
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self.client.disconnect(), timeout=4)
+            if self.unpair and sys.platform == "win32":
+                with contextlib.suppress(Exception):
+                    ok = await asyncio.wait_for(self.client.unpair(), timeout=3)
+                    self.log(f"Unpair esito: {ok}")
+        except Exception as e:
+            self.log(f"(hard_close note: {e})")
 
     async def _start_bat_notify(self):
         try:
@@ -267,10 +298,13 @@ class BLEWorker(threading.Thread):
             self.log(f"(BAT notify fallita: {e})")
 
     def _on_bat(self, _h, data: bytearray):
+        # ignora se run precedente
+        if self.stop_event.is_set(): return
         pct, mv = parse_battery(data)
-        self.uiq.put(("bat", self.cfg.id, pct, mv, time.time()))
+        self.uiq.put(("bat", self.cfg.id, pct, mv, time.time(), self.generation))
 
     def _on_combined(self, _h, data: bytearray):
+        if self.stop_event.is_set(): return
         p = parse_combined(data)
         if not p: return
         ts, ax, ay, az, gx, gy, gz = p
@@ -278,9 +312,9 @@ class BLEWorker(threading.Thread):
         self.last_data_t = now
         if not self.started_once:
             self.started_once = True
-            self.uiq.put(("ready", self.cfg.id))
+            self.uiq.put(("ready", self.cfg.id, self.generation))
             self.log(f"Dati ricevuti su {self.active_uuid}")
-        self.uiq.put(("accgyr", self.cfg.id, now, ts, ax, ay, az, gx, gy, gz))
+        self.uiq.put(("accgyr", self.cfg.id, now, ts, ax, ay, az, gx, gy, gz, self.generation))
 
     async def _try_start_combined(self, uuid):
         self.active_uuid = uuid
@@ -321,6 +355,7 @@ class BLEWorker(threading.Thread):
         silent_for = (now - self.last_data_t) if self.last_data_t > 0 else NO_DATA_WATCHDOG_S + 1
         if silent_for <= NO_DATA_WATCHDOG_S:
             return True
+        # resubscribe
         if self.notify_resets < MAX_NOTIFY_RESETS:
             self.notify_resets += 1
             self.log(f"Watchdog: nessun dato da {silent_for:.1f}s → riattivo notify ({self.notify_resets}/{MAX_NOTIFY_RESETS})…")
@@ -334,11 +369,12 @@ class BLEWorker(threading.Thread):
                     return True
             except Exception as e:
                 self.log(f"(resubscribe fallita: {e})")
+        # reconnect
         if self.midstream_reconnects < MAX_MIDSTREAM_RECONNECTS:
             self.midstream_reconnects += 1
             self.log("Watchdog: riconnessione a caldo…")
             try:
-                with contextlib.suppress(Exception): await self.client.disconnect()
+                await self._hard_close()
                 await self._connect_once()
                 await self._start_bat_notify()
                 ok = await self._start_combined_with_fallbacks()
@@ -355,27 +391,26 @@ class BLEWorker(threading.Thread):
         try:
             await self._connect_once()
         except Exception as e:
-            self.uiq.put(("connect_failed", self.cfg.id, str(e)))
+            self.uiq.put(("connect_failed", self.cfg.id, str(e), self.generation))
             self.log(f"Errore connessione: {e}")
             return
 
+        # barriera: partire insieme
         try:
             self.log("In attesa dell’altro device…")
             self.barrier.wait(timeout=BARRIER_TIMEOUT_S)
         except Exception:
-            self.uiq.put(("connect_failed", self.cfg.id, "Barrier timeout"))
+            self.uiq.put(("connect_failed", self.cfg.id, "Barrier timeout", self.generation))
             self.log("⚠️ Barriera non raggiunta: chiudo per retry coordinato.")
-            with contextlib.suppress(Exception):
-                if self.client: await self.client.disconnect()
+            await self._hard_close()
             return
 
         await self._start_bat_notify()
         ok = await self._start_combined_with_fallbacks()
         if not ok:
-            self.uiq.put(("connect_failed", self.cfg.id, "Combined stream non disponibile"))
+            self.uiq.put(("connect_failed", self.cfg.id, "Combined stream non disponibile", self.generation))
             self.log("⚠️ Nessuna stream accesa (combined). Chiudo.")
-            with contextlib.suppress(Exception):
-                if self.client: await self.client.disconnect()
+            await self._hard_close()
             return
 
         while not self.stop_event.is_set():
@@ -384,12 +419,7 @@ class BLEWorker(threading.Thread):
                 break
             await asyncio.sleep(0.2)
 
-        with contextlib.suppress(Exception):
-            if self.client:
-                if self.active_uuid:
-                    await self.client.stop_notify(self.active_uuid)
-                await self.client.stop_notify(BAT_UUID)
-                await self.client.disconnect()
+        await self._hard_close()
         self.log("Chiuso.")
 
     def run(self):
@@ -417,6 +447,7 @@ class App:
         self.connected = set()
         self.closing = False
         self.retry_count = 0
+        self.generation = 0   # incrementa a ogni ciclo connettivo
 
         # timeline globale
         self.t0 = None
@@ -473,7 +504,7 @@ class App:
 
         # Scheduler state
         self._last_plot_t  = 0.0
-        self._last_tbl_t   = 0.0   # condiviso per entrambe le tabelle
+        self._last_tbl_t   = 0.0
         self._last_ylim_t  = {1:0.0, 2:0.0}
 
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -522,6 +553,10 @@ class App:
     # ===== Pulsanti =====
     def on_connect(self):
         if self.closing: return
+        # se venivamo da uno stop, piccola pausa per far “mollare” gli handle
+        time.sleep(COOLDOWN_AFTER_STOP_S)
+
+        self.generation += 1  # nuova sessione
         self._set_general("Risolvo i device…")
         self.btn_conn.configure(state="disabled"); self.btn_stop.configure(state="disabled")
         self._set_state(1, "Risoluzione…"); self._set_state(2, "Risoluzione…")
@@ -543,8 +578,10 @@ class App:
         self._set_general("Connessione…")
         self._set_state(1, f"Connessione a {r1.device.address}"); self._set_state(2, f"Connessione a {r2.device.address}")
         self.barrier = threading.Barrier(2)
-        w1 = BLEWorker(DevCfg(1, r1.device, COMBINED_UUID_1), self.uiq, self.stop_event, self.barrier, self._set_state)
-        w2 = BLEWorker(DevCfg(2, r2.device, COMBINED_UUID_2), self.uiq, self.stop_event, self.barrier, self._set_state)
+        w1 = BLEWorker(DevCfg(1, r1.device, COMBINED_UUID_1), self.uiq, self.stop_event,
+                       self.barrier, self._set_state, self.generation, UNPAIR_ON_DISCONNECT)
+        w2 = BLEWorker(DevCfg(2, r2.device, COMBINED_UUID_2), self.uiq, self.stop_event,
+                       self.barrier, self._set_state, self.generation, UNPAIR_ON_DISCONNECT)
         self.workers = [w1, w2]
         for w in self.workers: w.start()
 
@@ -552,12 +589,11 @@ class App:
         # spegne tutto e programma un retry breve
         self.stop_event.set()
         for w in self.workers:
-            with contextlib.suppress(Exception): w.join(timeout=1.5)
+            with contextlib.suppress(Exception): w.join(timeout=1.8)
         self.workers = []
         self.stop_event.clear()
         self.retry_count += 1
         self._set_general(f"Retry {self.retry_count}: {reason}. Nuova risoluzione…")
-        # riparte il resolver dopo un backoff
         def _restart():
             if self.closing: return
             self.resolver = Resolver(ADDR_1, ADDR_2, self.uiq, self.stop_event)
@@ -573,7 +609,7 @@ class App:
             with contextlib.suppress(Exception): self.resolver.join(timeout=1.0)
             self.resolver = None
         for w in self.workers:
-            with contextlib.suppress(Exception): w.join(timeout=2.0)
+            with contextlib.suppress(Exception): w.join(timeout=3.0)
         self.workers = []
         with contextlib.suppress(Exception): self._save_merged_csv_0p5s()
         self._set_state(1, "Disconnesso."); self._set_state(2, "Disconnesso.")
@@ -591,16 +627,16 @@ class App:
         if self.resolver:
             with contextlib.suppress(Exception): self.resolver.join(timeout=1.0)
         for w in self.workers:
-            with contextlib.suppress(Exception): w.join(timeout=2.0)
+            with contextlib.suppress(Exception): w.join(timeout=3.0)
         with contextlib.suppress(Exception): self._save_merged_csv_0p5s()
         with contextlib.suppress(Exception): self.root.destroy()
 
-    # ===== Main refresh (throttled) =====
+    # ===== Main refresh (throttled + generation guard) =====
     def refresh(self):
         now = time.time()
         drained = 0
+        gen = self.generation
 
-        # 1) drena la coda ma con un limite per tick
         try:
             while drained < MAX_QUEUE_DRAIN_PER_TICK:
                 item = self.uiq.get_nowait()
@@ -617,24 +653,29 @@ class App:
                     self._start_workers(r1, r2)
 
                 elif kind == "connected":
-                    _, dev_id = item
+                    _, dev_id, g = item
+                    if g != gen: continue
                     self.connected.add(dev_id)
                     if len(self.connected) == 2:
                         self._set_general("Connessi. In attesa dei primi dati…")
 
                 elif kind == "connect_failed":
-                    _, dev_id, why = item
+                    _, dev_id, why, g = item
+                    if g != gen: continue
                     self._set_state(dev_id, f"Connessione fallita: {why}")
                     self._abort_and_retry_later(f"Device #{dev_id}: {why}")
 
                 elif kind == "ready":
-                    self.ready.add(item[1])
+                    _, dev_id, g = item
+                    if g != gen: continue
+                    self.ready.add(dev_id)
                     if len(self.ready) == 2:
                         self.btn_stop.configure(state="normal")
                         self._set_general("Streaming")
 
                 elif kind == "bat":
-                    _, dev_id, pct, mv, tnow = item
+                    _, dev_id, pct, mv, tnow, g = item
+                    if g != gen: continue
                     if pct is not None: pct = clamp(pct, 0.0, 100.0)
                     filt = self.bat_filters[dev_id]
                     if tnow - filt.last_ui_t >= BAT_UPDATE_MIN_DT or filt.last_ui_t == 0.0:
@@ -642,7 +683,8 @@ class App:
                         self._set_bat(dev_id, spct, mv)
 
                 elif kind == "accgyr":
-                    _, dev_id, t_host, ts_ble, ax, ay, az, gx, gy, gz = item
+                    _, dev_id, t_host, ts_ble, ax, ay, az, gx, gy, gz, g = item
+                    if g != gen: continue
                     if self.t0 is None:
                         self.t0 = time.time() - (self._global_last_time() + 0.02)
                     t_s = max(0.0, t_host - self.t0)
@@ -660,7 +702,7 @@ class App:
         except queue.Empty:
             pass
 
-        # 2) aggiorna tabelle (throttle)
+        # Tabelle (throttle)
         if (now - self._last_tbl_t) >= TABLE_INTERVAL_S:
             for dev_id, tree in [(1, self.tree1), (2, self.tree2)]:
                 B = self.buff[dev_id]
@@ -674,37 +716,44 @@ class App:
                     tree.delete(ch[0])
             self._last_tbl_t = now
 
-        # 3) aggiorna grafici (throttle)
+        # Grafici (throttle + decimazione)
         if (now - self._last_plot_t) >= PLOT_INTERVAL_S:
             for dev_id, ax_acc, ax_gyr in [(1,self.ax11,self.ax21),(2,self.ax12,self.ax22)]:
                 B = self.buff[dev_id]; t=list(B["t"])
                 if not t: continue
                 tmax = t[-1]; tmin = max(0.0, tmax - TIMEWINDOW_MS/1000.0)
-                # cerca i0
+                # trova i0
                 i0 = 0
                 for k in range(len(t)-1, -1, -1):
                     if t[k] < tmin: i0 = k+1; break
                 tf = t[i0:]
+                if not tf: continue
+                step = max(1, len(tf)//MAX_POINTS_PER_LINE)
+                tf2 = tf[::step]
+
                 # ACC
-                ax = list(B["ax"])[i0:]; ay = list(B["ay"])[i0:]; az = list(B["az"])[i0:]
+                ax = list(B["ax"])[i0:][::step]
+                ay = list(B["ay"])[i0:][::step]
+                az = list(B["az"])[i0:][::step]
                 L = self.lines[dev_id]
-                L["ax"].set_data(tf, ax); L["ay"].set_data(tf, ay); L["az"].set_data(tf, az)
-                if tf:
-                    ax_acc.set_xlim(max(0, tf[0]), max(tf[-1], 3))
-                    if (now - self._last_ylim_t[dev_id]) >= YLIM_INTERVAL_S:
-                        ymin = min(min(ax), min(ay), min(az)); ymax = max(max(ax), max(ay), max(az))
-                        pad = max(50.0, 0.1*(ymax-ymin+1))
-                        ax_acc.set_ylim(ymin-pad, ymax+pad)
+                L["ax"].set_data(tf2, ax); L["ay"].set_data(tf2, ay); L["az"].set_data(tf2, az)
+                ax_acc.set_xlim(max(0, tf2[0]), max(tf2[-1], 3))
+                if (now - self._last_ylim_t[dev_id]) >= YLIM_INTERVAL_S:
+                    ymin = min(min(ax), min(ay), min(az)); ymax = max(max(ax), max(ay), max(az))
+                    pad = max(50.0, 0.1*(ymax-ymin+1))
+                    ax_acc.set_ylim(ymin-pad, ymax-pad+2*pad)
+
                 # GYR
-                gx = list(B["gx"])[i0:]; gy = list(B["gy"])[i0:]; gz = list(B["gz"])[i0:]
-                L["gx"].set_data(tf, gx); L["gy"].set_data(tf, gy); L["gz"].set_data(tf, gz)
-                if tf:
-                    ax_gyr.set_xlim(max(0, tf[0]), max(tf[-1], 3))
-                    if (now - self._last_ylim_t[dev_id]) >= YLIM_INTERVAL_S:
-                        ymin = min(min(gx), min(gy), min(gz)); ymax = max(max(gx), max(gy), max(gz))
-                        pad = max(5.0, 0.1*(ymax-ymin+1))
-                        ax_gyr.set_ylim(ymin-pad, ymax+pad)
-                # aggiorna timestamp ylim per questo device se è stato ricalcolato
+                gx = list(B["gx"])[i0:][::step]
+                gy = list(B["gy"])[i0:][::step]
+                gz = list(B["gz"])[i0:][::step]
+                L["gx"].set_data(tf2, gx); L["gy"].set_data(tf2, gy); L["gz"].set_data(tf2, gz)
+                ax_gyr.set_xlim(max(0, tf2[0]), max(tf2[-1], 3))
+                if (now - self._last_ylim_t[dev_id]) >= YLIM_INTERVAL_S:
+                    ymin = min(min(gx), min(gy), min(gz)); ymax = max(max(gx), max(gy), max(gz))
+                    pad = max(5.0, 0.1*(ymax-ymin+1))
+                    ax_gyr.set_ylim(ymin-pad, ymax-pad+2*pad)
+
                 if (now - self._last_ylim_t[dev_id]) >= YLIM_INTERVAL_S:
                     self._last_ylim_t[dev_id] = now
 
