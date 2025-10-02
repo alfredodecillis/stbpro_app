@@ -12,10 +12,52 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from bleak import BleakClient, BleakScanner
+from bleak import BleakScanner
 
+async def resolve_ble_device_windows(addr_hint: str | None, name_hint: str | None, scan_s: float = 8.0):
+    """
+    Restituisce (BLEDevice | None, elenco_trovati) su Windows.
+    - Match ordine: MAC esatto -> MAC contiene/suffisso -> nome contiene name_hint (es. 'stb_pro').
+    - elenco_trovati: lista di tuple (name, address, rssi) per log/debug.
+    """
+    if not sys.platform.startswith("win"):
+        return None, []
+
+    async with BleakScanner() as s:
+        await asyncio.sleep(scan_s)
+        pairs = list(s.discovered_devices_and_advertisement_data.values())
+
+    found_list = []
+    th = (addr_hint or "").lower().strip()
+    nh = (name_hint or "").lower().strip()
+
+    best = None
+    for dev, adv in pairs:
+        name = (dev.name or getattr(adv, "local_name", None) or "").strip()
+        addr = (dev.address or "").strip()
+        rssi = getattr(adv, "rssi", None)
+        found_list.append((name, addr, rssi))
+
+        a = addr.lower()
+        n = name.lower()
+        if th and a == th:
+            best = dev; break
+        if th and th in a:
+            best = dev  # candidato (non uscire, magari troviamo esatto)
+        if not best and nh and nh in n:
+            best = dev
+
+    return best, found_list
+import sys, asyncio
+if sys.platform.startswith("win"):
+    try:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    except Exception:
+        pass
+        
 # ===================== CONFIG =====================
-ADDR_1 = "3718ACE8-DF5F-6A95-C883-B0A70601A2F7"  # STB_PRO #1
-ADDR_2 = "51C9EADA-28B1-2EAF-8711-E411311F64EA"  # STB_PRO #2
+ADDR_1 = "DA:F9:0A:9C:AD:07"  # STB_PRO #1
+ADDR_2 = "E4:9D:3B:F9:E1:A0"  # STB_PRO #2
 
 # UUID "combined" (ACC+GYR in un frame)
 COMBINED_UUID_1 = "00c00000-0001-11e1-ac36-0002a5d5c51b"  # #1 noto
@@ -150,38 +192,60 @@ class BLEWorker(threading.Thread):
     def log(self, msg): self.status_cb(self.cfg.id, msg)
 
     async def _connect_with_retries(self):
-        last_exc = None
-        for attempt in range(1, CONNECT_RETRIES + 1):
-            self.log(f"Connessione a {self.cfg.addr} (tentativo {attempt}/{CONNECT_RETRIES}, timeout {CONNECT_TIMEOUT_S}s)…")
-            try:
-                # Su Windows risolviamo il BLEDevice via scansione, altrove usiamo l'indirizzo
-                if sys.platform == "win32":
-                    dev_obj = await resolve_ble_device_windows(self.cfg.addr, scan_s=4.0)
-                    if not dev_obj:
-                        raise RuntimeError("Device non trovato in scansione")
-                    cl = BleakClient(dev_obj, disconnected_callback=lambda c: self.log("Disconnesso."))
-                else:
-                    cl = BleakClient(self.cfg.addr, disconnected_callback=lambda c: self.log("Disconnesso."))
+    last_exc = None
+    for attempt in range(1, CONNECT_RETRIES + 1):
+        self.log(f"Connessione a {self.cfg.addr} (tentativo {attempt}/{CONNECT_RETRIES}, timeout {CONNECT_TIMEOUT_S}s)…")
 
-                await asyncio.wait_for(cl.connect(), timeout=CONNECT_TIMEOUT_S)
-                await asyncio.sleep(POST_CONNECT_WAIT_S)
-                try: await asyncio.wait_for(cl.get_services(), timeout=5)
-                except Exception: pass
-                self.client = cl
-                self.log("Connesso.")
-                return
-            except Exception as e:
-                last_exc = e
-                self.log(f"Errore: {type(e).__name__}: {e}")
-                try:
-                    if 'cl' in locals(): await cl.disconnect()
-                except Exception:
-                    pass
-                if attempt < CONNECT_RETRIES:
-                    backoff = RETRY_BACKOFF_BASE_S * attempt
-                    self.log(f"Riprovo tra {backoff:.1f}s…")
-                    await asyncio.sleep(backoff)
-        raise last_exc if last_exc else RuntimeError("Connessione fallita")
+        client_arg = self.cfg.addr  # default: uso la stringa address
+        # Su Windows prova sempre a risolvere via scan e usa il BLEDevice risultante
+        if sys.platform.startswith("win"):
+            dev, seen = await resolve_ble_device_windows(
+                addr_hint=(self.cfg.addr or ""),
+                name_hint="stb_pro",
+                scan_s=8.0
+            )
+            if seen:
+                self.log("Scan visti:\n" + "\n".join(
+                    [f"  - name='{n or '-'}' addr={a or '-'} rssi={r}" for (n,a,r) in seen]
+                ))
+            if dev is None:
+                self.log("Nessun match allo scan. Verifica: Posizione ON, device non accoppiato, riavvio BT/PC.")
+            else:
+                client_arg = dev
+
+        cl = BleakClient(client_arg, disconnected_callback=lambda c: self.log("Disconnesso."))
+        try:
+            await asyncio.wait_for(cl.connect(), timeout=CONNECT_TIMEOUT_S)
+            await asyncio.sleep(POST_CONNECT_WAIT_S)
+            try:
+                await asyncio.wait_for(cl.get_services(), timeout=6)
+            except Exception:
+                pass
+
+            # (opzionale) verifica servizio BlueST e suggerisci clear della GATT cache se manca
+            try:
+                svcs = await cl.get_services()
+                if not any(s.uuid.lower() == BLUEST_SERVICE for s in svcs):
+                    self.log("⚠️ Servizio BlueST non trovato. Probabile GATT cache: rimuovi i device in Windows, riavvia BT o PC e riprova.")
+                else:
+                    self.log("Servizio BlueST presente.")
+            except Exception:
+                pass
+
+            self.client = cl
+            self.log("Connesso.")
+            return
+        except Exception as e:
+            last_exc = e
+            self.log(f"Errore: {type(e).__name__}: {e}")
+            try: await cl.disconnect()
+            except Exception: pass
+            if attempt < CONNECT_RETRIES:
+                backoff = RETRY_BACKOFF_BASE_S * attempt
+                self.log(f"Riprovo tra {backoff:.1f}s…")
+                await asyncio.sleep(backoff)
+
+    raise last_exc if last_exc else RuntimeError("Connessione fallita")
 
     def _on_bat(self, _h, data: bytearray):
         pct, mv = parse_battery(data)
