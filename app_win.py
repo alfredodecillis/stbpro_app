@@ -1,80 +1,64 @@
-# stbpro_dual_sync_ui_v3_watchdog.py
-# - GUI: 4 grafici (ACC/GYR #1 e #2) a sinistra + 2 tabelle a destra
-# - Stato generale + stati per #1 e #2 + batteria filtrata
-# - Start sincronizzato: parte quando entrambi hanno ricevuto il primo campione
-# - CSV: un dato ogni 0.5 s (timeline regolare, hold-last-value)
-# - Connessione: più ritentativi + watchdog no-data (resubscribe/reconnect)
-# - Timeline continua tra Stop e nuova connessione (niente "indietro" all’avvio dei grafici)
+# stbpro_dual_sync_ui_v3_watchdog_winprescan.py
+# - GUI invariata (4 grafici: ACC/GYR #1 e #2 a sinistra; 2 tabelle a destra)
+# - Stato generale + stati per #1 e #2
+# - Start sincronizzato SOLO dopo aver ricevuto il primo campione da entrambi
+# - CSV: un dato ogni 0.5 s, timeline regolare (hold-last-value)
+# - Connessione: ritentativi + watchdog no-data con ri-sottoscrizione/riconnessione
+# - Batteria: EMA + slew-rate + update rate limit per evitare salti
+# - **NUOVO**: pre-scan su Windows per trovare DUE device distinti (stessa sessione)
 
-import sys
-import os
-import csv
-import time
-import struct
-import asyncio
-import threading
-import queue
+import sys, asyncio, struct, time, csv, os, threading, queue
 from collections import deque, defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-
 from bleak import BleakClient, BleakScanner
 
 # ===================== CONFIG =====================
-# Indirizzi (MAC/UUID) dei due STB_PRO
-ADDR_1 = "3718ACE8-DF5F-6A95-C883-B0A70601A2F7"  # STB_PRO #1
-ADDR_2 = "51C9EADA-28B1-2EAF-8711-E411311F64EA"  # STB_PRO #2
+ADDR_1 = "3718ACE8-DF5F-6A95-C883-B0A70601A2F7"  # STB_PRO #1 (hint address; accetta anche suffisso)
+ADDR_2 = "51C9EADA-28B1-2EAF-8711-E411311F64EA"  # STB_PRO #2 (hint address; accetta anche suffisso)
 
-# UUID "combined" (ACC+GYR in un frame) — noti per ciascun device
-COMBINED_UUID_1 = "00c00000-0001-11e1-ac36-0002a5d5c51b"  # #1
-COMBINED_UUID_2 = "00e00000-0001-11e1-ac36-0002a5d5c51b"  # #2
+# UUID "combined" (ACC+GYR in un frame)
+COMBINED_UUID_1 = "00c00000-0001-11e1-ac36-0002a5d5c51b"  # #1 noto
+COMBINED_UUID_2 = "00e00000-0001-11e1-ac36-0002a5d5c51b"  # #2 noto
 
-# BlueST
-BLUEST_SERVICE = "00000000-0001-11e1-9ab4-0002a5d5c51b"
-BAT_UUID       = "00020000-0001-11e1-ac36-0002a5d5c51b"
+# BlueST service per filtro scan
+BLUEST_SERVICE   = "00000000-0001-11e1-9ab4-0002a5d5c51b"
+BAT_UUID         = "00020000-0001-11e1-ac36-0002a5d5c51b"
 
-# Candidati autodetect combined (usati come fallback)
+# Candidati autodetect combined (fallback se la "nota" non manda dati)
 COMBINED_CANDIDATES = [
     "00c00000-0001-11e1-ac36-0002a5d5c51b",
     "00e00000-0001-11e1-ac36-0002a5d5c51b",
     "00190000-0001-11e1-ac36-0002a5d5c51b",
     "00000100-0001-11e1-ac36-0002a5d5c51b",
-    "00000014-0002-11e1-ac36-0002a5d5c51b",  # a volte console/control
+    "00000014-0002-11e1-ac36-0002a5d5c51b",  # console/control su alcune board
 ]
 
-# Connessione / retry
-CONNECT_TIMEOUT_S     = 10
-CONNECT_RETRIES       = 5
-RETRY_BACKOFF_BASE_S  = 1.2
-POST_CONNECT_WAIT_S   = 1.0
+CONNECT_TIMEOUT_S      = 10
+CONNECT_RETRIES        = 5
+RETRY_BACKOFF_BASE_S   = 1.2   # 1.2, 2.4, 3.6, ...
+POST_CONNECT_WAIT_S    = 1.0
 
 # GUI
-TIMEWINDOW_MS = 60_00  # 6 s visivi
-REFRESH_MS    = 60
+TIMEWINDOW_MS          = 60_00  # 6 s visivi (asse X in secondi)
+REFRESH_MS             = 60
 
 # CSV: 1 riga ogni 0.5 s
-CSV_BIN_MS = 500
+CSV_BIN_MS            = 500
 
-# Avvio stream: cambia UUID/ri-sottoscrivi se non arrivano dati in tempo
-START_DATA_TIMEOUT_S = 2.5
+# Avvio stream: attendi dati veri entro questo tempo, altrimenti cambia UUID/ri-sottoscrivi
+START_DATA_TIMEOUT_S   = 2.5
 
-# Watchdog streaming: se muti per N secondi, prova resubscribe/reconnect
-NO_DATA_WATCHDOG_S        = 5.0
-MAX_NOTIFY_RESETS         = 2
-MAX_MIDSTREAM_RECONNECTS  = 1
+# Watchdog durante streaming: se non arrivano dati per N secondi, resubscribe/reconnect
+NO_DATA_WATCHDOG_S     = 5.0
+MAX_NOTIFY_RESETS      = 2      # per ogni connessione
+MAX_MIDSTREAM_RECONNECTS = 1    # quante volte può riconnettere a caldo
 
 # Batteria smoothing
-BAT_UPDATE_MIN_DT = 1.5   # s
-BAT_EMA_ALPHA     = 0.08
-BAT_MAX_STEP      = 1.0   # % max per update
-
-# ===================== Windows: event loop policy =====================
-if sys.platform.startswith("win"):
-    try:
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    except Exception:
-        pass
+BAT_UPDATE_MIN_DT      = 1.5    # s
+BAT_EMA_ALPHA          = 0.08
+BAT_MAX_STEP           = 1.0    # % max per update
 
 # ===================== GUI deps =====================
 import tkinter as tk
@@ -83,87 +67,106 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
 # ===================== Utils =====================
-def clamp(v, lo, hi):
-    return max(lo, min(hi, v))
+def clamp(v, lo, hi): return max(lo, min(hi, v))
 
 # Combined frame: 2B ts + 6*int16 (acc mg, gyr 0.1 dps)
 def parse_combined(payload: bytes):
-    if len(payload) < 14:
-        return None
+    if len(payload) < 14: return None
     ts = int.from_bytes(payload[0:2], "little", signed=False)
     ax, ay, az, gx, gy, gz = struct.unpack_from("<hhhhhh", payload, 2)
-    return ts, ax, ay, az, gx / 10.0, gy / 10.0, gz / 10.0
+    return ts, ax, ay, az, gx/10.0, gy/10.0, gz/10.0
 
-# Batteria: 1B % o 2B mV (3300..4400). Se % mancante ma mV presenti, deriva %
+# Batteria: prova 1B percentuale o 2B mV (3300..4200/4400), fallback % da mV
 def parse_battery(payload: bytes):
-    b = bytes(payload)
-    pct = None
-    mv = None
+    b = bytes(payload); pct=None; mv=None
     for i in range(len(b)):
         if 0 <= b[i] <= 100:
-            pct = float(b[i])
-            break
-    for i in range(len(b) - 1):
-        v = int.from_bytes(b[i:i + 2], "little", signed=False)
-        if 3000 <= v <= 4400:
-            mv = float(v)
-            break
+            pct = float(b[i]); break
+    for i in range(len(b)-1):
+        v = int.from_bytes(b[i:i+2], "little", signed=False)
+        if 3000 <= v <= 4400: mv = float(v); break
     if pct is None and mv is not None:
-        pct = clamp((mv - 3300.0) * (100.0 / 900.0), 0.0, 100.0)
+        pct = clamp((mv - 3300.0) * (100.0/900.0), 0.0, 100.0)
     return pct, mv
 
 class SlewEMA:
     def __init__(self, alpha=BAT_EMA_ALPHA, max_step=BAT_MAX_STEP):
-        self.alpha = alpha
-        self.max_step = max_step
-        self.ema = None
-        self.last = None
-        self.last_ui_t = 0.0
-
+        self.alpha = alpha; self.max_step = max_step
+        self.ema = None; self.last = None; self.last_ui_t = 0.0
     def update(self, x, now):
-        if x is None:
-            return self.last
-        self.ema = x if self.ema is None else (self.ema + self.alpha * (x - self.ema))
+        if x is None: return self.last
+        self.ema = x if self.ema is None else (self.ema + self.alpha*(x - self.ema))
         cand = self.ema if self.last is None else self.last + clamp(self.ema - self.last, -self.max_step, self.max_step)
-        self.last = cand
-        self.last_ui_t = now
+        self.last = cand; self.last_ui_t = now
         return self.last
 
-# ---------------- Windows: risolvi il device via scan (nome/indirizzo) ----------------
-async def resolve_ble_device_windows(addr_hint: str | None, name_hint: str | None, scan_s: float = 8.0):
+# ===================== Pre-scan Windows: trova *due* device distinti =====================
+def _addr_matches_hint(addr: str, hint: str|None) -> bool:
+    if not hint:
+        return True
+    a = (addr or "").lower()
+    h = hint.lower()
+    return (a == h) or (h in a)  # consente match parziale/suffisso
+
+async def scan_collect(service_uuid=BLUEST_SERVICE, seconds=8.0):
     """
-    Ritorna (BLEDevice|None, lista_visti). Cerca per address pieno/parziale o nome (es. 'stb_pro').
-    Su non-Windows ritorna (None, []).
+    Colleziona annunci BLE per 'seconds'. Filtra per service_uuid se presente.
+    Ritorna lista di tuple (device, adv) senza duplicati per address, ordinata per RSSI decrescente.
     """
-    if not sys.platform.startswith("win"):
-        return None, []
+    found = {}  # address -> (dev, adv)
 
-    async with BleakScanner() as s:
-        await asyncio.sleep(scan_s)
-        pairs = list(s.discovered_devices_and_advertisement_data.values())
+    def cb(dev, adv):
+        su = set(adv.service_uuids or [])
+        if service_uuid and (service_uuid.lower() not in {s.lower() for s in su}):
+            return
+        found[dev.address] = (dev, adv)  # mantieni ultimo (RSSI aggiornato)
 
-    found = []
-    th = (addr_hint or "").lower().strip()
-    nh = (name_hint or "").lower().strip()
-    best = None
+    async with BleakScanner(detection_callback=cb) as s:
+        await asyncio.sleep(seconds)
 
-    for dev, adv in pairs:
-        name = (dev.name or getattr(adv, "local_name", None) or "").strip()
-        addr = (dev.address or "").strip()
-        rssi = getattr(adv, "rssi", None)
-        found.append((name, addr, rssi))
+    items = list(found.values())
+    items.sort(key=lambda da: (da[1].rssi or -999), reverse=True)
+    return items
 
-        a = addr.lower()
-        n = name.lower()
-        if th and a == th:
-            best = dev
+async def find_two_distinct_devices(addr1_hint: str|None, addr2_hint: str|None,
+                                    rounds: int = 3, seconds_per_round: float = 6.0):
+    """
+    Restituisce due BLEDevice distinti (dev1, dev2) cercandoli in max 'rounds'.
+    - Filtra per service BlueST
+    - Matcha addr1_hint e addr2_hint (interi o suffisso)
+    - Se non trova entrambi, estende durata e riprova
+    """
+    dev1 = None; dev2 = None
+    for _ in range(rounds):
+        items = await scan_collect(BLUEST_SERVICE, seconds=seconds_per_round)
+        cand1 = None; cand2 = None
+
+        # prova match esplicito vs hint
+        for dev, adv in items:
+            if cand1 is None and _addr_matches_hint(dev.address, addr1_hint):
+                cand1 = dev
+            if cand2 is None and _addr_matches_hint(dev.address, addr2_hint) and (cand1 is None or dev.address != cand1.address):
+                cand2 = dev
+            if cand1 and cand2 and cand1.address != cand2.address:
+                break
+
+        # fallback: prendi i primi due distinti per RSSI
+        if (cand1 is None or cand2 is None) and len(items) >= 2:
+            distinct = []
+            for dev, adv in items:
+                if all(dev.address != d.address for d in distinct):
+                    distinct.append(dev)
+                if len(distinct) >= 2: break
+            if cand1 is None and len(distinct) >= 1: cand1 = distinct[0]
+            if cand2 is None and len(distinct) >= 2 and distinct[1].address != cand1.address: cand2 = distinct[1]
+
+        if cand1 and cand2 and cand1.address != cand2.address:
+            dev1, dev2 = cand1, cand2
             break
-        if th and th in a and best is None:
-            best = dev
-        if not best and nh and nh in n:
-            best = dev
 
-    return best, found
+        seconds_per_round += 3.0  # allunga lo scan e riprova
+
+    return dev1, dev2
 
 # ===================== BLE Worker =====================
 @dataclass
@@ -184,96 +187,53 @@ class BLEWorker(threading.Thread):
         self.preferred_uuid = cfg.combined_uuid
         self.active_uuid = None
 
-        # watchdog/stream state
+        # watchdog
         self.last_data_t = 0.0
         self.notify_resets = 0
         self.midstream_reconnects = 0
-        self.started_once = False
+        self.started_once = False  # primo campione arrivato
 
-    def log(self, msg):
-        self.status_cb(self.cfg.id, msg)
+    def log(self, msg): self.status_cb(self.cfg.id, msg)
 
     async def _connect_with_retries(self):
         last_exc = None
         for attempt in range(1, CONNECT_RETRIES + 1):
-            self.log(
-                f"Connessione a {self.cfg.addr} (tentativo {attempt}/{CONNECT_RETRIES}, timeout {CONNECT_TIMEOUT_S}s)…"
-            )
-
-            client_arg = self.cfg.addr  # default: stringa indirizzo
-
-            # Su Windows: prova a risolvere via scan e usa direttamente il BLEDevice
-            if sys.platform.startswith("win"):
-                dev, seen = await resolve_ble_device_windows(
-                    addr_hint=(self.cfg.addr or ""),
-                    name_hint="stb_pro",
-                    scan_s=8.0,
-                )
-                if seen:
-                    self.log(
-                        "Scan visti:\n" + "\n".join(
-                            [f"  - name='{n or '-'}' addr={a or '-'} rssi={r}" for (n, a, r) in seen]
-                        )
-                    )
-                if dev is None:
-                    self.log("Nessun match allo scan. Verifica: Posizione ON, device non accoppiato, riavvio BT/PC.")
-                else:
-                    client_arg = dev
-
-            cl = BleakClient(client_arg, disconnected_callback=lambda c: self.log("Disconnesso."))
+            self.log(f"Connessione a {self.cfg.addr} (tentativo {attempt}/{CONNECT_RETRIES}, timeout {CONNECT_TIMEOUT_S}s)…")
+            cl = BleakClient(self.cfg.addr, disconnected_callback=lambda c: self.log("Disconnesso."))
             try:
                 await asyncio.wait_for(cl.connect(), timeout=CONNECT_TIMEOUT_S)
                 await asyncio.sleep(POST_CONNECT_WAIT_S)
-                # Precarica servizi per evitare problemi di notify
-                try:
-                    await asyncio.wait_for(cl.get_services(), timeout=6)
-                except Exception:
-                    pass
-
-                # (opzionale) controlla la presenza del servizio BlueST
-                try:
-                    svcs = await cl.get_services()
-                    if not any(s.uuid.lower() == BLUEST_SERVICE for s in svcs):
-                        self.log(
-                            "⚠️ Servizio BlueST non trovato. Possibile cache GATT: rimuovi i device in Windows, "
-                            "riavvia BT o PC e riprova."
-                        )
-                    else:
-                        self.log("Servizio BlueST presente.")
-                except Exception:
-                    pass
-
+                try: await asyncio.wait_for(cl.get_services(), timeout=5)
+                except Exception: pass
                 self.client = cl
                 self.log("Connesso.")
                 return
             except Exception as e:
                 last_exc = e
                 self.log(f"Errore: {type(e).__name__}: {e}")
-                try:
-                    await cl.disconnect()
-                except Exception:
-                    pass
+                try: await cl.disconnect()
+                except Exception: pass
                 if attempt < CONNECT_RETRIES:
                     backoff = RETRY_BACKOFF_BASE_S * attempt
                     self.log(f"Riprovo tra {backoff:.1f}s…")
                     await asyncio.sleep(backoff)
-
         raise last_exc if last_exc else RuntimeError("Connessione fallita")
 
+    # --- callback batteria ---
     def _on_bat(self, _h, data: bytearray):
         pct, mv = parse_battery(data)
         self.uiq.put(("bat", self.cfg.id, pct, mv, time.time()))
 
+    # --- callback combined ---
     def _on_combined(self, _h, data: bytearray):
         p = parse_combined(data)
-        if not p:
-            return
+        if not p: return
         ts, ax, ay, az, gx, gy, gz = p
         now = time.time()
         self.last_data_t = now
         if not self.started_once:
             self.started_once = True
-            self.uiq.put(("ready", self.cfg.id))
+            self.uiq.put(("ready", self.cfg.id))  # segnala readiness sul primo dato reale
             self.log(f"Dati ricevuti su {self.active_uuid}")
         self.uiq.put(("accgyr", self.cfg.id, now, ts, ax, ay, az, gx, gy, gz))
 
@@ -287,13 +247,12 @@ class BLEWorker(threading.Thread):
     async def _try_start_combined(self, uuid):
         self.log(f"Tento combined su {uuid}…")
         self.active_uuid = uuid
+        self.last_data_t = 0.0
         got_first = asyncio.Event()
-
         def _tmp(h, data):
             self._on_combined(h, data)
             if not got_first.is_set():
                 got_first.set()
-
         try:
             await asyncio.wait_for(self.client.start_notify(uuid, _tmp), timeout=4)
         except Exception as e:
@@ -304,10 +263,8 @@ class BLEWorker(threading.Thread):
             return True
         except asyncio.TimeoutError:
             self.log(f"Nessun dato entro {START_DATA_TIMEOUT_S}s su {uuid}.")
-            try:
-                await self.client.stop_notify(uuid)
-            except Exception:
-                pass
+            try: await self.client.stop_notify(uuid)
+            except Exception: pass
             return False
 
     async def _start_combined_with_fallbacks(self):
@@ -315,11 +272,9 @@ class BLEWorker(threading.Thread):
         if self.preferred_uuid:
             ok = await self._try_start_combined(self.preferred_uuid)
             tried.append(self.preferred_uuid)
-            if ok:
-                return True
+            if ok: return True
         for cu in COMBINED_CANDIDATES:
-            if cu in tried:
-                continue
+            if cu in tried: continue
             ok = await self._try_start_combined(cu)
             if ok:
                 self.preferred_uuid = cu
@@ -337,10 +292,8 @@ class BLEWorker(threading.Thread):
             self.log(f"Watchdog: nessun dato da {silent_for:.1f}s → riattivo notify ({self.notify_resets}/{MAX_NOTIFY_RESETS})…")
             try:
                 if self.active_uuid:
-                    try:
-                        await self.client.stop_notify(self.active_uuid)
-                    except Exception:
-                        pass
+                    try: await self.client.stop_notify(self.active_uuid)
+                    except Exception: pass
                 ok = await self._start_combined_with_fallbacks()
                 if ok:
                     self.log("Notify riattivata con successo.")
@@ -352,10 +305,8 @@ class BLEWorker(threading.Thread):
             self.midstream_reconnects += 1
             self.log("Watchdog: riconnessione a caldo…")
             try:
-                try:
-                    await self.client.disconnect()
-                except Exception:
-                    pass
+                try: await self.client.disconnect()
+                except Exception: pass
                 await self._connect_with_retries()
                 await self._start_bat_notify()
                 ok = await self._start_combined_with_fallbacks()
@@ -365,7 +316,6 @@ class BLEWorker(threading.Thread):
                     return True
             except Exception as e:
                 self.log(f"(riconnessione fallita: {e})")
-        # fallito tutto
         self.log("⚠️ Stream non recuperabile. Chiudo.")
         return False
 
@@ -376,7 +326,6 @@ class BLEWorker(threading.Thread):
             self.log(f"Errore connessione: {e}")
             return
 
-        # barriera: partenza insieme
         try:
             self.log("In attesa dell’altro device…")
             self.barrier.wait(timeout=15)
@@ -395,22 +344,18 @@ class BLEWorker(threading.Thread):
                 break
             await asyncio.sleep(0.2)
 
-        # cleanup
         try:
             if self.client:
                 try:
                     if self.active_uuid:
                         await self.client.stop_notify(self.active_uuid)
-                except Exception:
-                    pass
+                except Exception: pass
                 try:
                     await self.client.stop_notify(BAT_UUID)
-                except Exception:
-                    pass
+                except Exception: pass
                 try:
                     await self.client.disconnect()
-                except Exception:
-                    pass
+                except Exception: pass
         except Exception:
             pass
         self.log("Chiuso.")
@@ -421,12 +366,10 @@ class BLEWorker(threading.Thread):
         try:
             loop.run_until_complete(self.run_async())
         finally:
-            try:
-                loop.stop()
-            finally:
-                loop.close()
+            try: loop.stop()
+            finally: loop.close()
 
-# ===================== APP (GUI) =====================
+# ===================== APP =====================
 class App:
     def __init__(self, root):
         self.root = root
@@ -454,27 +397,19 @@ class App:
         self.csv_path = None
 
         # ===== Top bar =====
-        top = ttk.Frame(root, padding=6)
-        top.pack(fill="x")
+        top = ttk.Frame(root, padding=6); top.pack(fill="x")
         self.btn_conn = ttk.Button(top, text="Connetti", command=self.on_connect)
         self.btn_stop = ttk.Button(top, text="Stop", command=self.on_stop, state="disabled")
-        self.btn_conn.pack(side="left", padx=(0, 6))
-        self.btn_stop.pack(side="left")
+        self.btn_conn.pack(side="left", padx=(0,6)); self.btn_stop.pack(side="left")
 
-        self.lbl_gen = ttk.Label(top, text="Stato generale: Pronto")
-        self.lbl_gen.pack(side="left", padx=14)
-        self.lbl_s1 = ttk.Label(top, text="Stato #1: —")
-        self.lbl_s1.pack(side="left", padx=10)
-        self.lbl_b1 = ttk.Label(top, text="Batteria #1: —")
-        self.lbl_b1.pack(side="left", padx=6)
-        self.lbl_s2 = ttk.Label(top, text="Stato #2: —")
-        self.lbl_s2.pack(side="left", padx=10)
-        self.lbl_b2 = ttk.Label(top, text="Batteria #2: —")
-        self.lbl_b2.pack(side="left", padx=6)
+        self.lbl_gen = ttk.Label(top, text="Stato generale: Pronto"); self.lbl_gen.pack(side="left", padx=14)
+        self.lbl_s1  = ttk.Label(top, text="Stato #1: —"); self.lbl_s1.pack(side="left", padx=10)
+        self.lbl_b1  = ttk.Label(top, text="Batteria #1: —"); self.lbl_b1.pack(side="left", padx=6)
+        self.lbl_s2  = ttk.Label(top, text="Stato #2: —"); self.lbl_s2.pack(side="left", padx=10)
+        self.lbl_b2  = ttk.Label(top, text="Batteria #2: —"); self.lbl_b2.pack(side="left", padx=6)
 
         # ===== Corpo: sinistra grafici, destra tabelle =====
-        body = ttk.Frame(root, padding=6)
-        body.pack(fill="both", expand=True)
+        body = ttk.Frame(root, padding=6); body.pack(fill="both", expand=True)
 
         self.fig = Figure(figsize=(9.0, 6.8), dpi=100)
         self.ax11 = self.fig.add_subplot(221); self._setup_ax(self.ax11, "ACC #1", "mg")
@@ -487,26 +422,25 @@ class App:
         self.canvas_widget = self.canvas.get_tk_widget()
         self.canvas_widget.pack(side="left", fill="both", expand=True)
 
-        right = ttk.Frame(body)
-        right.pack(side="left", fill="both", expand=False, padx=(6, 0))
+        right = ttk.Frame(body); right.pack(side="left", fill="both", expand=False, padx=(6,0))
         self.tree1 = self._make_table(right, "ACC/GYR #1 — ultimi 50")
         self.tree2 = self._make_table(right, "ACC/GYR #2 — ultimi 50")
 
         # buffer plotting per device
         self.buff = {
-            1: {k: deque(maxlen=TIMEWINDOW_MS) for k in ["t", "ax", "ay", "az", "gx", "gy", "gz"]},
-            2: {k: deque(maxlen=TIMEWINDOW_MS) for k in ["t", "ax", "ay", "az", "gx", "gy", "gz"]},
+            1: {k: deque(maxlen=TIMEWINDOW_MS) for k in ["t","ax","ay","az","gx","gy","gz"]},
+            2: {k: deque(maxlen=TIMEWINDOW_MS) for k in ["t","ax","ay","az","gx","gy","gz"]},
         }
         # linee
         self.lines = {}
-        for dev_id, ax_acc, ax_gyr in [(1, self.ax11, self.ax21), (2, self.ax12, self.ax22)]:
+        for dev_id, ax_acc, ax_gyr in [(1,self.ax11,self.ax21),(2,self.ax12,self.ax22)]:
             (lax,) = ax_acc.plot([], [], label="ax")
             (lay,) = ax_acc.plot([], [], label="ay")
             (laz,) = ax_acc.plot([], [], label="az"); ax_acc.legend(loc="upper left")
             (lgx,) = ax_gyr.plot([], [], label="gx")
             (lgy,) = ax_gyr.plot([], [], label="gy")
             (lgz,) = ax_gyr.plot([], [], label="gz"); ax_gyr.legend(loc="upper left")
-            self.lines[dev_id] = {"ax": lax, "ay": lay, "az": laz, "gx": lgx, "gy": lgy, "gz": lgz}
+            self.lines[dev_id] = {"ax":lax,"ay":lay,"az":laz,"gx":lgx,"gy":lgy,"gz":lgz}
 
         # loop UI
         root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -514,132 +448,121 @@ class App:
 
     # ====== UI helpers ======
     def _setup_ax(self, ax, title, ylab, xlabel=False):
-        ax.set_title(title)
-        ax.set_ylabel(ylab)
+        ax.set_title(title); ax.set_ylabel(ylab)
         ax.set_xlabel("tempo [s]" if xlabel else "")
         ax.grid(True)
 
     def _make_table(self, parent, title):
-        frm = ttk.LabelFrame(parent, text=title, padding=4)
-        frm.pack(fill="both", expand=True, pady=4)
-        cols = ("t[s]", "ax", "ay", "az", "gx", "gy", "gz")
+        frm = ttk.LabelFrame(parent, text=title, padding=4); frm.pack(fill="both", expand=True, pady=4)
+        cols=("t[s]","ax","ay","az","gx","gy","gz")
         tree = ttk.Treeview(frm, columns=cols, show="headings", height=18)
         for c in cols:
-            w = 80 if c == "t[s]" else 70
-            tree.heading(c, text=c)
-            tree.column(c, width=w, anchor="e")
+            w = 80 if c=="t[s]" else 70
+            tree.heading(c, text=c); tree.column(c, width=w, anchor="e")
         vsb = ttk.Scrollbar(frm, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=vsb.set)
-        tree.grid(row=0, column=0, sticky="nsew")
-        vsb.grid(row=0, column=1, sticky="ns")
-        frm.grid_columnconfigure(0, weight=1)
-        frm.grid_rowconfigure(0, weight=1)
+        tree.grid(row=0, column=0, sticky="nsew"); vsb.grid(row=0, column=1, sticky="ns")
+        frm.grid_columnconfigure(0, weight=1); frm.grid_rowconfigure(0, weight=1)
         return tree
 
     def _set_state(self, dev_id, msg):
-        if dev_id == 1:
-            self.lbl_s1.config(text=f"Stato #1: {msg}")
-        else:
-            self.lbl_s2.config(text=f"Stato #2: {msg}")
+        if dev_id == 1: self.lbl_s1.config(text=f"Stato #1: {msg}")
+        else:           self.lbl_s2.config(text=f"Stato #2: {msg}")
 
     def _set_bat(self, dev_id, pct, mv):
         if pct is None and mv is None:
             txt = "—"
         else:
             txt = f"{int(round(pct))}%" if pct is not None else "—"
-            if mv is not None:
-                txt += f" ({mv / 1000:.2f} V)"
-        (self.lbl_b1 if dev_id == 1 else self.lbl_b2).config(text=f"Batteria #{dev_id}: {txt}")
+            if mv is not None: txt += f" ({mv/1000:.2f} V)"
+        (self.lbl_b1 if dev_id==1 else self.lbl_b2).config(text=f"Batteria #{dev_id}: {txt}")
 
-    def _set_general(self, txt):
-        self.lbl_gen.config(text=f"Stato generale: {txt}")
+    def _set_general(self, txt): self.lbl_gen.config(text=f"Stato generale: {txt}")
 
     def _global_last_time(self):
         last = 0.0
-        for dev in (1, 2):
+        for dev in (1,2):
             t = self.buff[dev]["t"]
-            if t:
-                last = max(last, t[-1])
+            if t: last = max(last, t[-1])
         return last
 
     # ====== Pulsanti ======
     def on_connect(self):
-        if self.closing:
-            return
+        if self.closing: return
         self._set_general("Connessione…")
-        self.btn_conn.configure(state="disabled")
-        self.btn_stop.configure(state="disabled")
-        self._set_state(1, "Connessione…")
-        self._set_state(2, "Connessione…")
-        self._set_bat(1, None, None)
-        self._set_bat(2, None, None)
-        self.ready.clear()
-        self.stop_event.clear()
+        self.btn_conn.configure(state="disabled"); self.btn_stop.configure(state="disabled")
+        self._set_state(1, "Risoluzione device…"); self._set_state(2, "Risoluzione device…")
+        self._set_bat(1, None, None); self._set_bat(2, None, None)
+        self.ready.clear(); self.stop_event.clear()
         # reset CSV bins
         self.csv_bins = {1: {}, 2: {}}
         self.bat_filters = {1: SlewEMA(), 2: SlewEMA()}
-        self.csv_path = Path.home() / "Desktop" / f"stbpro_dual_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        self.csv_path = (Path.home()/ "Desktop" / f"stbpro_dual_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
 
-        # timeline continua: non azzero i buffer; riallineo t0 per evitare "indietro"
+        # timeline continua: NON azzero i buffer; mantengo X continua
         self.t_last_global = self._global_last_time()
         epsilon = 0.02
         self.t0 = time.time() - (self.t_last_global + epsilon)
 
+        # ---- NUOVO: pre-scan (solo Windows) per trovare DUE device distinti
+        def _resolve_both_blocking():
+            if sys.platform != "win32":
+                return None, None
+            addr1_hint = ADDR_1
+            addr2_hint = ADDR_2
+            return asyncio.run(find_two_distinct_devices(addr1_hint, addr2_hint,
+                                                         rounds=3, seconds_per_round=6.0))
+        dev1, dev2 = _resolve_both_blocking()
+        if sys.platform == "win32":
+            if not (dev1 and dev2):
+                self._set_general("Errore: non trovati entrambi in scansione.")
+                self._set_state(1, "Non trovato"); self._set_state(2, "Non trovato")
+                self.btn_conn.configure(state="normal")
+                return
+            resolved_addr1 = dev1.address
+            resolved_addr2 = dev2.address
+            self._set_state(1, f"Trovato {resolved_addr1}")
+            self._set_state(2, f"Trovato {resolved_addr2}")
+        else:
+            resolved_addr1 = ADDR_1
+            resolved_addr2 = ADDR_2
+
         # barriera & workers
         self.barrier = threading.Barrier(2)
-        w1 = BLEWorker(DevCfg(1, ADDR_1, COMBINED_UUID_1), self.uiq, self.stop_event, self.barrier, self._set_state)
-        w2 = BLEWorker(DevCfg(2, ADDR_2, COMBINED_UUID_2), self.uiq, self.stop_event, self.barrier, self._set_state)
+        w1 = BLEWorker(DevCfg(1, resolved_addr1, COMBINED_UUID_1), self.uiq, self.stop_event, self.barrier, self._set_state)
+        w2 = BLEWorker(DevCfg(2, resolved_addr2, COMBINED_UUID_2), self.uiq, self.stop_event, self.barrier, self._set_state)
         self.workers = [w1, w2]
-        for w in self.workers:
-            w.start()
+        for w in self.workers: w.start()
 
     def on_stop(self):
-        if self.closing:
-            return
-        try:
-            self.root.after_cancel(self._after)
-        except Exception:
-            pass
+        if self.closing: return
+        try: self.root.after_cancel(self._after)
+        except Exception: pass
         self.stop_event.set()
         for w in self.workers:
-            try:
-                w.join(timeout=2.0)
-            except Exception:
-                pass
-        try:
-            self._save_merged_csv_0p5s()
-        except Exception as e:
-            print("(CSV fallito)", e)
-        self._set_state(1, "Disconnesso.")
-        self._set_state(2, "Disconnesso.")
+            try: w.join(timeout=2.0)
+            except Exception: pass
+        try: self._save_merged_csv_0p5s()
+        except Exception as e: print("(CSV fallito)", e)
+        self._set_state(1, "Disconnesso."); self._set_state(2, "Disconnesso.")
         self._set_general("Arrestato")
-        self.btn_conn.configure(state="normal")
-        self.btn_stop.configure(state="disabled")
+        self.btn_conn.configure(state="normal"); self.btn_stop.configure(state="disabled")
         self._after = self.root.after(REFRESH_MS, self.refresh)
 
     def on_close(self):
-        if self.closing:
-            return
+        if self.closing: return
         self.closing = True
-        try:
-            self.root.after_cancel(self._after)
-        except Exception:
-            pass
+        try: self.root.after_cancel(self._after)
+        except Exception: pass
         self._set_general("Chiusura…")
         self.stop_event.set()
         for w in self.workers:
-            try:
-                w.join(timeout=2.0)
-            except Exception:
-                pass
-        try:
-            self._save_merged_csv_0p5s()
-        except Exception:
-            pass
-        try:
-            self.root.destroy()
-        except Exception:
-            pass
+            try: w.join(timeout=2.0)
+            except Exception: pass
+        try: self._save_merged_csv_0p5s()
+        except Exception: pass
+        try: self.root.destroy()
+        except Exception: pass
 
     # ====== Main refresh ======
     def refresh(self):
@@ -649,14 +572,12 @@ class App:
                 kind = item[0]
                 if kind == "ready":
                     self.ready.add(item[1])
-                    # abilita Stop solo quando ENTRAMBI hanno ricevuto il primo campione
                     if len(self.ready) == 2:
                         self.btn_stop.configure(state="normal")
                         self._set_general("Streaming")
                 elif kind == "bat":
                     _, dev_id, pct, mv, tnow = item
-                    if pct is not None:
-                        pct = clamp(pct, 0.0, 100.0)
+                    if pct is not None: pct = clamp(pct, 0.0, 100.0)
                     filt = self.bat_filters[dev_id]
                     if tnow - filt.last_ui_t >= BAT_UPDATE_MIN_DT or filt.last_ui_t == 0.0:
                         spct = filt.update(pct, tnow)
@@ -670,60 +591,42 @@ class App:
                     B["t"].append(t_s)
                     B["ax"].append(ax); B["ay"].append(ay); B["az"].append(az)
                     B["gx"].append(gx); B["gy"].append(gy); B["gz"].append(gz)
-                    tree = self.tree1 if dev_id == 1 else self.tree2
+                    tree = self.tree1 if dev_id==1 else self.tree2
                     tree.insert("", "end", values=(f"{t_s:7.2f}", ax, ay, az, f"{gx:.1f}", f"{gy:.1f}", f"{gz:.1f}"))
                     ch = tree.get_children()
-                    if len(ch) > 50:
-                        tree.delete(ch[0])
-                    # CSV a 0.5 s: mantieni l'ultimo del bin
-                    t_ms = int(round(t_s * 1000))
+                    if len(ch) > 50: tree.delete(ch[0])
+                    # CSV a 0.5 s: ultimo del bin
+                    t_ms = int(round(t_s*1000))
                     bin_ms = (t_ms // CSV_BIN_MS) * CSV_BIN_MS
                     self.csv_bins[dev_id][bin_ms] = [ax, ay, az, gx, gy, gz]
         except queue.Empty:
             pass
 
         # aggiorna grafici
-        for dev_id, ax_acc, ax_gyr in [(1, self.ax11, self.ax21), (2, self.ax12, self.ax22)]:
-            B = self.buff[dev_id]
-            t = list(B["t"])
-            if not t:
-                continue
-            tmax = t[-1]
-            tmin = max(0.0, tmax - TIMEWINDOW_MS / 1000.0)
+        for dev_id, ax_acc, ax_gyr in [(1,self.ax11,self.ax21),(2,self.ax12,self.ax22)]:
+            B = self.buff[dev_id]; t=list(B["t"])
+            if not t: continue
+            tmax = t[-1]; tmin = max(0.0, tmax - TIMEWINDOW_MS/1000.0)
             # indice primo dentro finestra
             i0 = 0
-            for k in range(len(t) - 1, -1, -1):
-                if t[k] < tmin:
-                    i0 = k + 1
-                    break
+            for k in range(len(t)-1, -1, -1):
+                if t[k] < tmin: i0 = k+1; break
             tf = t[i0:]
             # ACC
-            ax = list(B["ax"])[i0:]
-            ay = list(B["ay"])[i0:]
-            az = list(B["az"])[i0:]
+            ax = list(B["ax"])[i0:]; ay = list(B["ay"])[i0:]; az = list(B["az"])[i0:]
             L = self.lines[dev_id]
-            L["ax"].set_data(tf, ax)
-            L["ay"].set_data(tf, ay)
-            L["az"].set_data(tf, az)
+            L["ax"].set_data(tf, ax); L["ay"].set_data(tf, ay); L["az"].set_data(tf, az)
             if tf:
                 ax_acc.set_xlim(max(0, tf[0]), max(tf[-1], 3))
-                ymin = min(ax + ay + az)
-                ymax = max(ax + ay + az)
-                pad = max(50.0, 0.1 * (ymax - ymin + 1))
-                ax_acc.set_ylim(ymin - pad, ymax + pad)
+                ymin = min(ax+ay+az); ymax = max(ax+ay+az); pad = max(50.0, 0.1*(ymax-ymin+1))
+                ax_acc.set_ylim(ymin-pad, ymax+pad)
             # GYR
-            gx = list(B["gx"])[i0:]
-            gy = list(B["gy"])[i0:]
-            gz = list(B["gz"])[i0:]
-            L["gx"].set_data(tf, gx)
-            L["gy"].set_data(tf, gy)
-            L["gz"].set_data(tf, gz)
+            gx = list(B["gx"])[i0:]; gy = list(B["gy"])[i0:]; gz = list(B["gz"])[i0:]
+            L["gx"].set_data(tf, gx); L["gy"].set_data(tf, gy); L["gz"].set_data(tf, gz)
             if tf:
                 ax_gyr.set_xlim(max(0, tf[0]), max(tf[-1], 3))
-                ymin = min(gx + gy + gz)
-                ymax = max(gx + gy + gz)
-                pad = max(5.0, 0.1 * (ymax - ymin + 1))
-                ax_gyr.set_ylim(ymin - pad, ymax + pad)
+                ymin = min(gx+gy+gz); ymax = max(gx+gy+gz); pad = max(5.0, 0.1*(ymax-ymin+1))
+                ax_gyr.set_ylim(ymin-pad, ymax+pad)
 
         self.canvas.draw_idle()
         if not self.closing:
@@ -731,35 +634,29 @@ class App:
 
     # ====== CSV (0.5 s, timeline regolare) ======
     def _save_merged_csv_0p5s(self):
-        b1 = self.csv_bins[1]
-        b2 = self.csv_bins[2]
+        b1 = self.csv_bins[1]; b2 = self.csv_bins[2]
         if not b1 and not b2:
-            print("→ Nessun dato, CSV non creato.")
-            return
+            print("→ Nessun dato, CSV non creato."); return
 
         max_bin = 0
-        if b1:
-            max_bin = max(max_bin, max(b1.keys()))
-        if b2:
-            max_bin = max(max_bin, max(b2.keys()))
+        if b1: max_bin = max(max_bin, max(b1.keys()))
+        if b2: max_bin = max(max_bin, max(b2.keys()))
 
-        last1 = [None] * 6
-        last2 = [None] * 6
+        last1 = [None]*6
+        last2 = [None]*6
 
         if self.csv_path is None:
             self.csv_path = Path.home() / "Desktop" / f"stbpro_dual_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         with open(self.csv_path, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["t_s",
-                        "ax#1", "ay#1", "az#1", "gx#1", "gy#1", "gz#1",
-                        "ax#2", "ay#2", "az#2", "gx#2", "gy#2", "gz#2"])
+                        "ax#1","ay#1","az#1","gx#1","gy#1","gz#1",
+                        "ax#2","ay#2","az#2","gx#2","gy#2","gz#2"])
             b = 0
             while b <= max_bin:
-                if b in b1:
-                    last1 = b1[b][:]
-                if b in b2:
-                    last2 = b2[b][:]
-                row = [f"{b / 1000.0:.3f}"] + \
+                if b in b1: last1 = b1[b][:]
+                if b in b2: last2 = b2[b][:]
+                row = [f"{b/1000.0:.3f}"] + \
                       [("" if v is None else v) for v in last1] + \
                       [("" if v is None else v) for v in last2]
                 w.writerow(row)
@@ -772,8 +669,7 @@ def main():
     root = tk.Tk()
     try:
         style = ttk.Style()
-        if "clam" in style.theme_names():
-            style.theme_use("clam")
+        if "clam" in style.theme_names(): style.theme_use("clam")
     except Exception:
         pass
     App(root)
