@@ -1,12 +1,9 @@
-# stbpro_dual_sync_ui_v4_windows_fix.py
-# - GUI invariata (4 grafici a sinistra; 2 tabelle a destra; stati in alto)
-# - Start sincronizzato SOLO dopo il primo campione da entrambi
-# - CSV: 1 riga/0.5 s, hold-last-value
-# - Connessione robusta: timeout "duro" + retry/backoff
-# - Windows: risoluzione BLEDevice via scan (evita hang su connect con address RPA)
-# - Avvio connessioni sfalsato (riduce lock del controller BT)
-# - Watchdog no-data: resubscribe / reconnect
-# - Batteria: EMA + slew limit
+# stbpro_dual_sync_ui_v5_connectscan.py
+# - Windows: re-scan PRIMA di ogni tentativo di connessione (RPA-friendly)
+# - Se il device non è in advertising, si salta il tentativo e si aspetta il backoff
+# - GUI invariata (4 grafici sinistra; 2 tabelle destra; stati in alto)
+# - Start sincronizzato al primo campione di entrambi; avvio sfalsato 1.5s
+# - CSV 0.5 s hold-last-value; watchdog no-data; battery smoothing
 
 import asyncio, struct, time, csv, os, threading, queue, contextlib, sys
 from collections import deque, defaultdict
@@ -38,8 +35,8 @@ COMBINED_CANDIDATES = [
 
 # Connessione/Retry
 CONNECT_TIMEOUT_S      = 10
-CONNECT_RETRIES        = 5
-RETRY_BACKOFF_BASE_S   = 1.2
+CONNECT_RETRIES        = 6
+RETRY_BACKOFF_BASE_S   = 1.3
 POST_CONNECT_WAIT_S    = 1.0
 
 # GUI
@@ -49,7 +46,7 @@ REFRESH_MS             = 60
 # CSV: 1 riga ogni 0.5 s
 CSV_BIN_MS             = 500
 
-# Avvio stream: entro quanto devono arrivare dati dalla combined
+# Avvio stream
 START_DATA_TIMEOUT_S   = 2.5
 
 # Watchdog "no data"
@@ -78,7 +75,7 @@ def parse_combined(payload: bytes):
     ax, ay, az, gx, gy, gz = struct.unpack_from("<hhhhhh", payload, 2)
     return ts, ax, ay, az, gx/10.0, gy/10.0, gz/10.0
 
-# Batteria: prova 1B percentuale o 2B mV 3300..4400 → fallback % da mV
+# Batteria: 1B percentuale o 2B mV 3300..4400 → fallback % da mV
 def parse_battery(payload: bytes):
     b = bytes(payload); pct=None; mv=None
     for i in range(len(b)):
@@ -102,47 +99,46 @@ class SlewEMA:
         self.last = cand; self.last_ui_t = now
         return self.last
 
-# ===================== Windows: risoluzione BLEDevice via scan =====================
-async def resolve_ble_device_windows(target_hint: str, scan_s: float = 6.0):
-    """
-    Ritorna un BLEDevice su Windows cercando per:
-      - match esatto address
-      - match su suffisso address
-      - nome contenente 'stb_pro' con hint nel nome o address
-    Ordinati per RSSI decrescente.
-    Su macOS/Linux ritorna None.
-    """
-    if sys.platform != "win32":
-        return None
-
-    hint = (target_hint or "").lower()
+# ===================== Windows: scan helper =====================
+async def scan_once_windows(scan_s: float = 4.0):
+    """Ritorna lista [(BLEDevice, AdvData)] ordinata per RSSI (desc)."""
     async with BleakScanner() as scanner:
         await asyncio.sleep(scan_s)
         pairs = list(scanner.discovered_devices_and_advertisement_data.values())
-
-    # sort per RSSI (prima i migliori)
     try:
         pairs.sort(key=lambda p: getattr(p[1], "rssi", -9999), reverse=True)
     except Exception:
         pass
+    return pairs
 
+async def resolve_bledevice_for_hint(hint: str, scan_s: float = 4.0):
+    """
+    Cerca su Windows un BLEDevice usando:
+      - match esatto address
+      - match su suffisso address (ultime 4-6 cifre)
+      - nome contenente 'stb_pro' e hint nel nome/address
+    """
+    if sys.platform != "win32":
+        return None, None
+    pairs = await scan_once_windows(scan_s=scan_s)
+    h = (hint or "").lower()
     for dev, adv in pairs:
         name = (dev.name or getattr(adv, "local_name", None) or "").lower()
         addr = (dev.address or "").lower()
-        if hint and addr == hint:
-            return dev
-        if hint and len(hint) >= 6 and addr.endswith(hint[-6:]):
-            return dev
-        if "stb_pro" in name and (not hint or hint in name or hint in addr):
-            return dev
-    return None
+        if h and addr == h:
+            return dev, adv
+        if h and len(h) >= 6 and addr.endswith(h[-6:]):
+            return dev, adv
+        if "stb_pro" in name and (not h or h in name or h in addr):
+            return dev, adv
+    return None, None
 
 # ===================== BLE Worker =====================
 @dataclass
 class DevCfg:
     id: int
     addr: str
-    combined_uuid: str | None  # preferita
+    combined_uuid: str | None
 
 class BLEWorker(threading.Thread):
     def __init__(self, cfg: DevCfg, ui_queue, stop_event, start_barrier, status_cb):
@@ -155,7 +151,7 @@ class BLEWorker(threading.Thread):
         self.client: BleakClient | None = None
         self.preferred_uuid = cfg.combined_uuid
         self.active_uuid = None
-        self.ble_target = None  # string address o BLEDevice (Windows)
+        self.ble_target = None  # string address o BLEDevice
 
         # watchdog
         self.last_data_t = 0.0
@@ -167,27 +163,50 @@ class BLEWorker(threading.Thread):
 
     async def _connect_with_retries(self):
         """
-        Connessione robusta con deadline dura: se connect non termina entro CONNECT_TIMEOUT_S,
-        forziamo disconnect e retry con backoff.
+        PRIMA di ogni tentativo:
+          - su Windows: breve SCAN per recuperare un BLEDevice fresco
+          - se non visto in advertising → salto tentativo (backoff) invece di tentare una connect a vuoto
         """
         last_exc = None
         for attempt in range(1, CONNECT_RETRIES + 1):
-            target = self.ble_target or self.cfg.addr
-            self.log(f"Connessione a {target} (tentativo {attempt}/{CONNECT_RETRIES}, timeout {CONNECT_TIMEOUT_S}s)…")
-            cl = BleakClient(target, disconnected_callback=lambda c: self.log("Disconnesso."))
+            target_for_log = self.cfg.addr
+
+            if sys.platform == "win32":
+                try:
+                    dev, adv = await resolve_bledevice_for_hint(self.cfg.addr, scan_s=3.0)
+                    if dev is None:
+                        self.log(f"Scan: device non visto, salto tentativo {attempt}/{CONNECT_RETRIES}.")
+                        # attendo backoff e riprovo
+                        if attempt < CONNECT_RETRIES:
+                            backoff = RETRY_BACKOFF_BASE_S * attempt
+                            self.log(f"Riprovo tra {backoff:.1f}s…")
+                            await asyncio.sleep(backoff)
+                            continue
+                        # esauriti i tentativi
+                        raise TimeoutError("Device non in advertising")
+                    self.ble_target = dev
+                    target_for_log = f"{dev.address} ({dev.name or '—'})"
+                except Exception as e:
+                    self.log(f"(scan fallita: {e}) — uso address diretto")
+                    self.ble_target = self.cfg.addr
+            else:
+                self.ble_target = self.cfg.addr
+
+            self.log(f"Connessione a {target_for_log} (tentativo {attempt}/{CONNECT_RETRIES}, timeout {CONNECT_TIMEOUT_S}s)…")
+            cl = BleakClient(self.ble_target, disconnected_callback=lambda c: self.log("Disconnesso."))
             try:
+                # timeout "duro"
                 task = asyncio.create_task(cl.connect())
                 done, _ = await asyncio.wait({task}, timeout=CONNECT_TIMEOUT_S)
                 if not done:
-                    self.log("Timeout connect: forzo disconnect e riprovo…")
+                    self.log("Timeout connect: forzo disconnect e backoff…")
                     with contextlib.suppress(Exception):
                         await cl.disconnect()
                     with contextlib.suppress(Exception):
                         task.cancel(); await task
                     raise asyncio.TimeoutError("Connect deadline exceeded")
 
-                # task completato (ok/errore)
-                await task  # rilancia eventuale eccezione
+                await task  # può rilanciare eccezione interna
                 await asyncio.sleep(POST_CONNECT_WAIT_S)
                 with contextlib.suppress(Exception):
                     await asyncio.wait_for(cl.get_services(), timeout=5)
@@ -307,20 +326,7 @@ class BLEWorker(threading.Thread):
         return False
 
     async def run_async(self):
-        # 0) Risoluzione BLEDevice su Windows
-        try:
-            dev = await resolve_ble_device_windows(self.cfg.addr, scan_s=6.0)
-            if dev:
-                self.ble_target = dev
-                self.log(f"Device risolto: {dev.address} ({dev.name or '—'})")
-            else:
-                self.ble_target = self.cfg.addr
-                self.log("Device non risolto via scan: uso address diretto.")
-        except Exception as e:
-            self.ble_target = self.cfg.addr
-            self.log(f"(scan risoluzione fallita: {e})")
-
-        # 1) Connect robusto
+        # 1) Connect robusto (con re-scan per tentativo su Windows)
         try:
             await self._connect_with_retries()
         except Exception as e:
@@ -512,7 +518,7 @@ class App:
         w2 = BLEWorker(DevCfg(2, ADDR_2, COMBINED_UUID_2), self.uiq, self.stop_event, self.barrier, self._set_state)
         self.workers = [w1, w2]
 
-        # avvio sfalsato: #1 ora, #2 tra 1.5 s
+        # avvio sfalsato
         w1.start()
         self.root.after(1500, lambda: w2.start())
 
