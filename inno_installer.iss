@@ -2,7 +2,7 @@
 
 [Setup]
 AppName=STB_PRO
-AppVersion=1.0.9
+AppVersion=1.0.10
 DefaultDirName={autopf}\STB_PRO
 DefaultGroupName=STB_PRO
 OutputBaseFilename=STB_PRO-Setup
