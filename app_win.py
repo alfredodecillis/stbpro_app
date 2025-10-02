@@ -549,7 +549,7 @@ class App:
         for w in self.workers:
             try: w.join(timeout=2.0)
             except Exception: pass
-        try: self._save_merged_csv_0.5s()
+        try: self._save_merged_csv_0p5s()
         except Exception: pass
         try: self.root.destroy()
         except Exception: pass
