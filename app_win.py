@@ -1,9 +1,8 @@
-# stbpro_dual_sync_ui_v8_harddisconnect.py
-# - Force disconnect + (Windows) unpair a ogni Stop/Close
-# - Cooldown prima di riconnettere
-# - Generation token per ignorare callback tardivi post-stop
-# - Throttling + decimazione punti per ridurre lag
-# - UI invariata (4 grafici a sinistra, 2 tabelle a destra), CSV 0.5 s invariato
+# stbpro_dual_sync_ui_v9_pairfix.py
+# - Pre-pairing SEQUENZIALE (uno alla volta) prima di aprire gli stream
+# - NIENTE unpair automatico allo stop (solo fallback su errore)
+# - Pair "on-demand" se start_notify fallisce per permessi (Access denied)
+# - UI invariata; CSV 0.5 s invariato; finestra grafici 6 s; throttling/decimazione come v8
 
 import sys, asyncio, contextlib, struct, time, csv, os, threading, queue
 from collections import deque, defaultdict
@@ -23,12 +22,15 @@ if sys.platform == "win32":
 ADDR_1 = "DA:F9:0A:9C:AD:07"   # STB_PRO #1
 ADDR_2 = "E4:9D:3B:F9:E1:A0"   # STB_PRO #2
 
+# UUID "combined" (ACC+GYR in un frame) note/attese
 COMBINED_UUID_1 = "00c00000-0001-11e1-ac36-0002a5d5c51b"
 COMBINED_UUID_2 = "00e00000-0001-11e1-ac36-0002a5d5c51b"
 
+# BlueST
 BLUEST_SERVICE = "00000000-0001-11e1-9ab4-0002a5d5c51b"
 BAT_UUID       = "00020000-0001-11e1-ac36-0002a5d5c51b"
 
+# Candidati (nel dubbio)
 COMBINED_CANDIDATES = [
     "00c00000-0001-11e1-ac36-0002a5d5c51b",
     "00e00000-0001-11e1-ac36-0002a5d5c51b",
@@ -53,23 +55,21 @@ MAX_NOTIFY_RESETS        = 2
 MAX_MIDSTREAM_RECONNECTS = 1
 
 # Disconnessione “pulita”
-UNPAIR_ON_DISCONNECT     = True   # su Windows prova a "dimenticare" il pairing
-COOLDOWN_AFTER_STOP_S    = 1.2    # prima di riavviare connessioni
+UNPAIR_ON_DISCONNECT     = False   # ← disabilitato per evitare loop di pairing
+COOLDOWN_AFTER_STOP_S    = 1.2
 
 # === GUI timing ===
-TIMEWINDOW_MS            = 60_00  # 6s
-REFRESH_TICK_MS          = 30     # tick della GUI (gestione coda + scheduling)
+TIMEWINDOW_MS            = 60_00
+REFRESH_TICK_MS          = 30
 
-# Throttling
-PLOT_INTERVAL_S          = 0.08   # ~12.5 FPS
+# Throttling/decimazione (anti-lag)
+PLOT_INTERVAL_S          = 0.08
 TABLE_INTERVAL_S         = 0.20
 YLIM_INTERVAL_S          = 0.50
 MAX_QUEUE_DRAIN_PER_TICK = 600
-
-# Decimazione punti per linea (riduce lag)
 MAX_POINTS_PER_LINE      = 900
 
-# CSV 0.5 s
+# CSV
 CSV_BIN_MS               = 500
 
 # Batteria smoothing
@@ -154,31 +154,27 @@ class Resolver(threading.Thread):
         t0 = time.time()
         suf1 = mac_suffix(self.addr1); suf2 = mac_suffix(self.addr2)
         f1 = None; f2 = None
-
         while not self.stop_event.is_set():
             if time.time() - t0 > RESOLVE_OVERALL_TIMEOUT:
                 return None, "Timeout risoluzione"
-
             pairs = await self._scan_slice(SCAN_SLICE_S)
+            # cand "STB_PRO" e connectable
             cand = []
             for dev, adv in pairs:
                 name = (dev.name or getattr(adv, "local_name", None) or "")
                 addr = norm_mac(dev.address)
-                if "stb_pro" not in name.lower():
-                    continue
-                if not _is_connectable(adv):
-                    continue
+                if "stb_pro" not in name.lower(): continue
+                if not _is_connectable(adv): continue
                 rssi = getattr(adv, "rssi", -9999)
                 cand.append((dev, adv, name, addr, rssi))
-
+            # match
             for dev, adv, name, addr, rssi in cand:
                 s = mac_suffix(addr)
                 if f1 is None and (addr == self.addr1 or s == suf1):
                     f1 = Resolved(1, self.addr1, dev, name, rssi)
                 elif f2 is None and (addr == self.addr2 or s == suf2):
                     f2 = Resolved(2, self.addr2, dev, name, rssi)
-
-            # fallback due migliori distinti
+            # fallback: due migliori distinti
             if (f1 is None or f2 is None) and len(cand) >= 2:
                 seen = {}; ordered = []
                 for dev, adv, name, addr, rssi in cand:
@@ -190,10 +186,8 @@ class Resolver(threading.Thread):
                     d2, n2, a2, r2 = ordered[1]
                     if f1 is None: f1 = Resolved(1, self.addr1, d1, n1, r1)
                     if f2 is None: f2 = Resolved(2, self.addr2, d2, n2, r2)
-
             if f1 and f2:
                 return (f1, f2), None
-
             await asyncio.sleep(RESOLVE_BACKOFF_S)
 
     def run(self):
@@ -210,6 +204,70 @@ class Resolver(threading.Thread):
             with contextlib.suppress(Exception): loop.stop()
             with contextlib.suppress(Exception): loop.close()
 
+# ============== PRE-PAIRING SEQUENZIALE (UNO ALLA VOLTA) ==============
+PAIR_MUTEX = threading.Lock()
+
+class PrePairer(threading.Thread):
+    """Accoppia #1 e #2 in sequenza (se non già paired), poi segnala 'prepair_done'."""
+    def __init__(self, r1: Resolved, r2: Resolved, uiq: queue.Queue, stop_event: threading.Event):
+        super().__init__(daemon=True)
+        self.r1 = r1; self.r2 = r2
+        self.uiq = uiq; self.stop_event = stop_event
+
+    async def _connect_deadline(self, client: BleakClient, timeout=CONNECT_TIMEOUT_S):
+        task = asyncio.create_task(client.connect())
+        done, _ = await asyncio.wait({task}, timeout=timeout)
+        if not done:
+            with contextlib.suppress(Exception): await client.disconnect()
+            with contextlib.suppress(Exception): task.cancel(); await task
+            raise asyncio.TimeoutError("Connect deadline exceeded")
+        await task
+        await asyncio.sleep(POST_CONNECT_WAIT_S)
+
+    async def _pair_one(self, dev_id: int, device_obj):
+        disp = f"{getattr(device_obj, 'address', 'n/a')} ({getattr(device_obj, 'name', '—')})"
+        self.uiq.put(("pair_status", dev_id, f"Accoppiamento {disp}…"))
+        client = BleakClient(device_obj)
+        try:
+            await self._connect_deadline(client)
+        except Exception as e:
+            self.uiq.put(("pair_status", dev_id, f"Connessione per pair fallita: {e}"))
+            return
+        # Verifica/parifica
+        try:
+            paired = True
+            try: paired = await client.is_paired()
+            except Exception: paired = True  # alcuni backend non espongono
+            if not paired and sys.platform == "win32":
+                with PAIR_MUTEX:  # SERIALIZZA il pairing
+                    try:
+                        ok = await client.pair(protection_level=1)
+                        self.uiq.put(("pair_status", dev_id, f"Pair esito: {ok}"))
+                    except Exception as e:
+                        self.uiq.put(("pair_status", dev_id, f"Pair fallito: {e}"))
+            else:
+                self.uiq.put(("pair_status", dev_id, "Già paired"))
+        finally:
+            with contextlib.suppress(Exception): await client.disconnect()
+            self.uiq.put(("pair_status", dev_id, "Pairing OK"))
+
+    async def run_async(self):
+        # #1 poi #2 (se stop richiesto, esce)
+        if not self.stop_event.is_set():
+            await self._pair_one(1, self.r1.device)
+        if not self.stop_event.is_set():
+            await self._pair_one(2, self.r2.device)
+        self.uiq.put(("prepair_done", self.r1, self.r2))
+
+    def run(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self.run_async())
+        finally:
+            with contextlib.suppress(Exception): loop.stop()
+            with contextlib.suppress(Exception): loop.close()
+
 # ===================== Worker BLE =====================
 @dataclass
 class DevCfg:
@@ -219,8 +277,7 @@ class DevCfg:
 
 class BLEWorker(threading.Thread):
     def __init__(self, cfg: DevCfg, uiq: queue.Queue, stop_event: threading.Event,
-                 start_barrier: threading.Barrier, status_cb, generation: int,
-                 unpair_on_disconnect: bool = UNPAIR_ON_DISCONNECT):
+                 start_barrier: threading.Barrier, status_cb, generation: int):
         super().__init__(daemon=True)
         self.cfg = cfg
         self.uiq = uiq
@@ -235,7 +292,6 @@ class BLEWorker(threading.Thread):
         self.midstream_reconnects = 0
         self.started_once = False
         self.generation = generation
-        self.unpair = unpair_on_disconnect
 
     def log(self, msg): self.status_cb(self.cfg.id, msg)
 
@@ -243,7 +299,6 @@ class BLEWorker(threading.Thread):
         target = self.cfg.device
         disp = f"{getattr(target, 'address', 'n/a')} ({getattr(target, 'name', '—')})"
         self.log(f"Connessione a {disp} (timeout {CONNECT_TIMEOUT_S}s)…")
-
         cl = BleakClient(target, disconnected_callback=lambda c: self.log("Disconnesso."))
         task = asyncio.create_task(cl.connect())
         done, _ = await asyncio.wait({task}, timeout=CONNECT_TIMEOUT_S)
@@ -252,28 +307,14 @@ class BLEWorker(threading.Thread):
             with contextlib.suppress(Exception): task.cancel(); await task
             raise asyncio.TimeoutError("Connect deadline exceeded")
         await task
-
-        if sys.platform == "win32":
-            # effettua pairing se necessario
-            try:
-                paired = await cl.is_paired()
-            except Exception:
-                paired = True
-            if not paired:
-                with contextlib.suppress(Exception):
-                    ok = await cl.pair(protection_level=1)
-                    self.log(f"Pairing esito: {ok}")
-
         await asyncio.sleep(POST_CONNECT_WAIT_S)
         with contextlib.suppress(Exception):
             await asyncio.wait_for(cl.get_services(), timeout=5)
-
         self.client = cl
         self.uiq.put(("connected", self.cfg.id, self.generation))
         self.log("Connesso.")
 
-    async def _hard_close(self):
-        """Stop notify + disconnect + (Windows) unpair per liberare lo stack."""
+    async def _hard_close(self, do_unpair=False):
         if not self.client: return
         try:
             if self.active_uuid:
@@ -283,7 +324,7 @@ class BLEWorker(threading.Thread):
                 await asyncio.wait_for(self.client.stop_notify(BAT_UUID), timeout=2)
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(self.client.disconnect(), timeout=4)
-            if self.unpair and sys.platform == "win32":
+            if do_unpair and sys.platform == "win32":
                 with contextlib.suppress(Exception):
                     ok = await asyncio.wait_for(self.client.unpair(), timeout=3)
                     self.log(f"Unpair esito: {ok}")
@@ -298,7 +339,6 @@ class BLEWorker(threading.Thread):
             self.log(f"(BAT notify fallita: {e})")
 
     def _on_bat(self, _h, data: bytearray):
-        # ignora se run precedente
         if self.stop_event.is_set(): return
         pct, mv = parse_battery(data)
         self.uiq.put(("bat", self.cfg.id, pct, mv, time.time(), self.generation))
@@ -316,6 +356,10 @@ class BLEWorker(threading.Thread):
             self.log(f"Dati ricevuti su {self.active_uuid}")
         self.uiq.put(("accgyr", self.cfg.id, now, ts, ax, ay, az, gx, gy, gz, self.generation))
 
+    def _is_access_denied(self, exc: Exception) -> bool:
+        s = str(exc).lower()
+        return ("access is denied" in s) or ("0x80070005" in s)
+
     async def _try_start_combined(self, uuid):
         self.active_uuid = uuid
         got_first = asyncio.Event()
@@ -326,7 +370,21 @@ class BLEWorker(threading.Thread):
             await asyncio.wait_for(self.client.start_notify(uuid, _tmp), timeout=4)
         except Exception as e:
             self.log(f"(start_notify fallita su {uuid}: {e})")
-            return False
+            # se errori di permesso → prova pairing on-demand
+            if sys.platform == "win32" and self._is_access_denied(e):
+                self.log("Access denied → provo pairing on-demand…")
+                try:
+                    with PAIR_MUTEX:
+                        ok = await self.client.pair(protection_level=1)
+                        self.log(f"Pair on-demand: {ok}")
+                    # riprova
+                    await asyncio.wait_for(self.client.start_notify(uuid, _tmp), timeout=4)
+                except Exception as e2:
+                    self.log(f"(on-demand pair/start fallito: {e2})")
+                    return False
+            else:
+                return False
+        # attesa primo dato
         try:
             await asyncio.wait_for(got_first.wait(), timeout=START_DATA_TIMEOUT_S)
             return True
@@ -369,12 +427,12 @@ class BLEWorker(threading.Thread):
                     return True
             except Exception as e:
                 self.log(f"(resubscribe fallita: {e})")
-        # reconnect
+        # reconnect (senza unpair)
         if self.midstream_reconnects < MAX_MIDSTREAM_RECONNECTS:
             self.midstream_reconnects += 1
             self.log("Watchdog: riconnessione a caldo…")
             try:
-                await self._hard_close()
+                await self._hard_close(do_unpair=False)
                 await self._connect_once()
                 await self._start_bat_notify()
                 ok = await self._start_combined_with_fallbacks()
@@ -402,7 +460,7 @@ class BLEWorker(threading.Thread):
         except Exception:
             self.uiq.put(("connect_failed", self.cfg.id, "Barrier timeout", self.generation))
             self.log("⚠️ Barriera non raggiunta: chiudo per retry coordinato.")
-            await self._hard_close()
+            await self._hard_close(do_unpair=False)
             return
 
         await self._start_bat_notify()
@@ -410,7 +468,7 @@ class BLEWorker(threading.Thread):
         if not ok:
             self.uiq.put(("connect_failed", self.cfg.id, "Combined stream non disponibile", self.generation))
             self.log("⚠️ Nessuna stream accesa (combined). Chiudo.")
-            await self._hard_close()
+            await self._hard_close(do_unpair=False)
             return
 
         while not self.stop_event.is_set():
@@ -419,7 +477,7 @@ class BLEWorker(threading.Thread):
                 break
             await asyncio.sleep(0.2)
 
-        await self._hard_close()
+        await self._hard_close(do_unpair=False)
         self.log("Chiuso.")
 
     def run(self):
@@ -442,12 +500,13 @@ class App:
         self.stop_event = threading.Event()
         self.workers = []
         self.resolver = None
+        self.prepairer = None
         self.barrier = None
         self.ready = set()
         self.connected = set()
         self.closing = False
         self.retry_count = 0
-        self.generation = 0   # incrementa a ogni ciclo connettivo
+        self.generation = 0
 
         # timeline globale
         self.t0 = None
@@ -553,10 +612,8 @@ class App:
     # ===== Pulsanti =====
     def on_connect(self):
         if self.closing: return
-        # se venivamo da uno stop, piccola pausa per far “mollare” gli handle
         time.sleep(COOLDOWN_AFTER_STOP_S)
-
-        self.generation += 1  # nuova sessione
+        self.generation += 1
         self._set_general("Risolvo i device…")
         self.btn_conn.configure(state="disabled"); self.btn_stop.configure(state="disabled")
         self._set_state(1, "Risoluzione…"); self._set_state(2, "Risoluzione…")
@@ -565,29 +622,29 @@ class App:
         self.csv_bins = {1:{}, 2:{}}
         self.bat_filters = {1:SlewEMA(), 2:SlewEMA()}
         self.csv_path = (Path.home()/ "Desktop" / f"stbpro_dual_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
-
-        # timeline continua
         self.t_last_global = self._global_last_time()
         self.t0 = time.time() - (self.t_last_global + 0.02)
-
         # avvia resolver
         self.resolver = Resolver(ADDR_1, ADDR_2, self.uiq, self.stop_event)
         self.resolver.start()
 
     def _start_workers(self, r1: Resolved, r2: Resolved):
-        self._set_general("Connessione…")
-        self._set_state(1, f"Connessione a {r1.device.address}"); self._set_state(2, f"Connessione a {r2.device.address}")
+        self._set_general("Connessione… (post-pair)")
+        self._set_state(1, f"Connessione a {r1.device.address}")
+        self._set_state(2, f"Connessione a {r2.device.address}")
         self.barrier = threading.Barrier(2)
         w1 = BLEWorker(DevCfg(1, r1.device, COMBINED_UUID_1), self.uiq, self.stop_event,
-                       self.barrier, self._set_state, self.generation, UNPAIR_ON_DISCONNECT)
+                       self.barrier, self._set_state, self.generation)
         w2 = BLEWorker(DevCfg(2, r2.device, COMBINED_UUID_2), self.uiq, self.stop_event,
-                       self.barrier, self._set_state, self.generation, UNPAIR_ON_DISCONNECT)
+                       self.barrier, self._set_state, self.generation)
         self.workers = [w1, w2]
         for w in self.workers: w.start()
 
     def _abort_and_retry_later(self, reason=""):
-        # spegne tutto e programma un retry breve
         self.stop_event.set()
+        if self.prepairer:
+            with contextlib.suppress(Exception): self.prepairer.join(timeout=1.2)
+            self.prepairer = None
         for w in self.workers:
             with contextlib.suppress(Exception): w.join(timeout=1.8)
         self.workers = []
@@ -608,6 +665,9 @@ class App:
         if self.resolver:
             with contextlib.suppress(Exception): self.resolver.join(timeout=1.0)
             self.resolver = None
+        if self.prepairer:
+            with contextlib.suppress(Exception): self.prepairer.join(timeout=1.0)
+            self.prepairer = None
         for w in self.workers:
             with contextlib.suppress(Exception): w.join(timeout=3.0)
         self.workers = []
@@ -626,17 +686,18 @@ class App:
         self.stop_event.set()
         if self.resolver:
             with contextlib.suppress(Exception): self.resolver.join(timeout=1.0)
+        if self.prepairer:
+            with contextlib.suppress(Exception): self.prepairer.join(timeout=1.0)
         for w in self.workers:
             with contextlib.suppress(Exception): w.join(timeout=3.0)
         with contextlib.suppress(Exception): self._save_merged_csv_0p5s()
         with contextlib.suppress(Exception): self.root.destroy()
 
-    # ===== Main refresh (throttled + generation guard) =====
+    # ===== Main refresh =====
     def refresh(self):
         now = time.time()
         drained = 0
         gen = self.generation
-
         try:
             while drained < MAX_QUEUE_DRAIN_PER_TICK:
                 item = self.uiq.get_nowait()
@@ -649,6 +710,17 @@ class App:
                     self._abort_and_retry_later(msg)
 
                 elif kind == "resolved_both":
+                    _, r1, r2 = item
+                    self._set_general("Accoppiamento sequenziale…")
+                    self._set_state(1, "Pair in corso…"); self._set_state(2, "Pair in corso…")
+                    self.prepairer = PrePairer(r1, r2, self.uiq, self.stop_event)
+                    self.prepairer.start()
+
+                elif kind == "pair_status":
+                    _, dev_id, msg = item
+                    self._set_state(dev_id, msg)
+
+                elif kind == "prepair_done":
                     _, r1, r2 = item
                     self._start_workers(r1, r2)
 
@@ -692,7 +764,7 @@ class App:
                     B["t"].append(t_s)
                     B["ax"].append(ax); B["ay"].append(ay); B["az"].append(az)
                     B["gx"].append(gx); B["gy"].append(gy); B["gz"].append(gz)
-                    # CSV a 0.5 s
+                    # CSV 0.5 s
                     t_ms = int(round(t_s*1000))
                     bin_ms = (t_ms // CSV_BIN_MS) * CSV_BIN_MS
                     self.csv_bins[dev_id][bin_ms] = [ax, ay, az, gx, gy, gz]
